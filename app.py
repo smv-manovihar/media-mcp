@@ -1,7 +1,8 @@
 import streamlit as st
 import os
 from client.agent import init_agent
-from utils.image_search_utils import incremental_scan_silent
+from utils.image_search_utils import scan_images
+from utils.fileops_utils import scan_files
 from config.settings import load_config, save_config
 
 st.set_page_config(page_title="MediaMCP", page_icon="🤖")
@@ -135,7 +136,7 @@ with st.sidebar:
                     with st.spinner(
                         "⏳ Scanning... This may take a while depending on paths."
                     ):
-                        result = incremental_scan_silent(valid_paths)
+                        result = scan_images(valid_paths, silent=True)
                     result_md = (
                         f"**Scan Complete:**\n"
                         f"- Total: `{result['total_media_count']}`\n"
@@ -207,19 +208,61 @@ with st.sidebar:
             st.rerun()
 
         st.markdown("---")
-        save_allowed_button = st.form_submit_button(
+        # --- MODIFIED: Added two buttons for Save and Scan ---
+        col1, col2 = st.columns(2)
+        scan_allowed_button = col1.form_submit_button(
+            "Save & Scan", use_container_width=True, type="primary"
+        )
+        save_allowed_button = col2.form_submit_button(
             "Save Changes", use_container_width=True
         )
 
-        if save_allowed_button:
+        if save_allowed_button or scan_allowed_button:
             config["allowed_paths"] = st.session_state.temp_allowed_paths
             save_config(config)
-            st.session_state.allowed_feedback = {
-                "status": "success",
-                "message": "✅ General Allowed Paths have been saved!",
-            }
-            st.session_state.pop("temp_allowed_paths", None)
-            st.rerun()
+
+            if save_allowed_button and not scan_allowed_button:
+                st.session_state.allowed_feedback = {
+                    "status": "success",
+                    "message": "✅ General Allowed Paths have been saved!",
+                }
+                st.session_state.pop("temp_allowed_paths", None)
+                st.rerun()
+
+            if scan_allowed_button:
+                valid_paths = [p for p in config["allowed_paths"] if os.path.isdir(p)]
+                if not valid_paths:
+                    st.session_state.allowed_feedback = {
+                        "status": "warning",
+                        "message": "No valid paths to scan.",
+                    }
+                    st.session_state.pop("temp_allowed_paths", None)
+                    st.rerun()
+
+                try:
+                    with st.spinner(
+                        "⏳ Scanning general files... This might take a while."
+                    ):
+                        result = scan_files(valid_paths, silent=True)
+                        result_md = (
+                            f"**Scan Complete:**\n"
+                            f"- Found: `{result['found']}`\n"
+                            f"- New: `{result['new']}`\n"
+                            f"- Updated: `{result['updated']}`\n"
+                            f"- Deleted: `{result['deleted']}`"
+                        )
+                        st.session_state.allowed_feedback = {
+                            "status": "success",
+                            "message": result_md,
+                        }
+                except Exception as e:
+                    st.session_state.allowed_feedback = {
+                        "status": "error",
+                        "message": f"❌ Scan failed: {e}",
+                    }
+                finally:
+                    st.session_state.pop("temp_allowed_paths", None)
+                    st.rerun()
 
     if st.session_state.allowed_feedback:
         fb = st.session_state.allowed_feedback

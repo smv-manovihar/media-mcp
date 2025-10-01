@@ -1,176 +1,115 @@
 # MediaMCP – Intelligent Local Media Management 🧠
 
-## Introduction
+Chat with your local photo and video library using the power of AI\! 🤖 MediaMCP combines local vision models for **privacy** 🛡️ with Groq's LLM API to create an intelligent, conversational media experience.
 
-**MediaMCP** is an open-source system that combines **local AI vision models** with **Groq’s LLM API** to turn your photo and video library into an intelligent, chat-driven experience.
-
-All heavy image and video processing stays on your computer for **total privacy**, while the LLM handles **natural-language conversation, reasoning, and tool orchestration** through the ReAct pattern.
+All heavy processing of your photos and videos happens on your machine, ensuring **total privacy**. The LLM acts as a smart orchestrator, understanding your **natural language commands** 🗣️ to search, organize, and manage your files.
 
 ---
 
-## Key Features
+## Core Features ✨
 
-- 💬 **Conversational Search**
-  Find images or clips with plain English queries such as “sunset photos from last May” or “videos of my dog at the beach.”
+- 💬 **Conversational Search**: Find media with simple queries like _"show me sunset photos from last May"_ 🌅 or _"find videos of my dog at the beach."_ 🐶
 
-- ✨ **Semantic Similarity**
-  Upload or pick a reference file and instantly retrieve visually similar items.
+- ✨ **Semantic Similarity Search**: Pick a reference image 🖼️ or use a text description to instantly find the most visually similar items in your library.
 
-- 📂 **Natural-Language Organization**
-  Tell the assistant to “organize vacation photos by city and separate food shots,” and it creates folders and moves files accordingly.
+- 📂 **Natural-Language File Management**: Use simple commands to manage your files. Ask the agent to `move photos to a new folder`, `copy specific files`, or `create a directory structure`. The LLM translates your request into the correct file operations.
 
-- ⚙️ **Smart Upload Pipeline**
-  Newly added media is auto-analyzed, embedded, and routed to the right folders or shown alongside similar existing content.
+- ⚙️ **Smart Ingestion Pipeline**: New media is automatically detected, scanned, and embedded 📥, making it immediately available for semantic search.
 
-- 🔒 **Local-First Privacy**
-  CLIP embeddings, thumbnails, and metadata are generated and stored entirely on-device; only text prompts are sent to Groq for language reasoning.
+- 🔒 **Privacy-First Architecture**: Image and video analysis, embedding generation (using **SigLIP**), and metadata extraction are performed **entirely on your device** 💻.
 
-- 🤔 **ReAct Agent Architecture**
-  The LLM thinks, calls MCP tools, observes results, and iterates—giving you interactive control without learning command syntax.
+- 🤔 **Transparent ReAct Agent**: The LLM "thinks" out loud, showing you which tools it's using and why. This gives you full visibility into the process without needing to learn any syntax.
 
-- ⚡ **Batch Efficiency**
-  Processes hundreds of files per minute with asynchronous pipelines and vector search acceleration.
-
-- 🛠️ **Extensible Toolset**
-  Add custom MCP tools (e.g., video trimming, face tagging) and expose them to the ReAct agent with one line of code.
+- 🛠️ **Extensible Toolset**: Easily add your own custom Python functions 🐍 and expose them to the AI agent to expand its capabilities.
 
 ---
 
-## Currently Implemented Features
+## How It Works 🗺️
 
-✅ **File Operations**
+MediaMCP uses a hybrid model that balances privacy and power:
 
-- Create, read, delete, move, and copy files/folders through natural language commands
-
-✅ **Media Scanning**
-
-- Incremental scanning of directories
-- Automatic detection of new, updated, or deleted media items
-
-✅ **Image Search**
-
-- Semantic text-to-image search (“find photos of mountains”)
-- Image-to-image similarity search using embeddings
-
-✅ **Conversational Agent**
-
-- ReAct-style reasoning steps visible in the UI
-- Tool invocation with live feedback
-- Chat-driven interactions with stored conversation history
-
-✅ **Web Search & Scraping**
-
-- Natural language web queries
-- Extracting and summarizing relevant content from webpages
-
-✅ **Privacy-First Design**
-
-- All embeddings and thumbnails stored locally
-- No raw media leaves your device
+1.  **💻 Local Processing**: A local AI vision model (**SigLIP**) scans your media files, generating vector embeddings. **Your files never leave your computer.**
+2.  **🗣️ Language Understanding**: When you type a command, the text is sent to the Groq LLM API.
+3.  **🤖 Reasoning & Tool Use**: The LLM uses a ReAct pattern to interpret your request and decide which local tool to use (e.g., `find_top_k_similar_images`, `move_file`).
+4.  **⚙️ Execution**: The local server executes the command on your filesystem.
+5.  **✅ Response**: The LLM observes the result, decides if the task is complete, and gives you a final response in the chat.
 
 ---
 
-## Pending Updates
+## Project Roadmap 🚀
 
-🔜 **Features in Progress**
+#### ✅ **Implemented**
 
-- **EXIF data extraction** – automatically extract and store metadata from photos and videos
-- **Batch Operations via Chat** – “delete all screenshots older than 2022”
-- **Video Analysis Tools** – semantic video search, keyframe extraction, and scene detection
-- **Improved Web Tooling** – richer scraping (tables, structured data) and source linking
-- **Cross-Device Sync** – optional syncing of metadata/indexes across devices
-- **UI Enhancements** – search filters, result image/video previews, and media browsing inside Streamlit
-- **Custom Tool Plug-ins** – easier registration of user-defined MCP tools
+- 🗂️ **Basic File System Operations**: Create, read, delete, move, and copy files/folders via chat.
+- 🔄 **Incremental Media Scanning**: Automatically detect new, updated, or removed media.
+- 🔎 **Semantic Search**: Text-to-image and image-to-image similarity search (`top_k`).
+- 🤖 **Conversational Agent**: ReAct-based agent with visible reasoning steps.
+- 🌐 **Web Search & Scraping**: Ask questions that require web access.
+- 📸 **EXIF Data Extraction**: Automatically read metadata like date, time, and location.
+
+#### 🔜 **In Progress & Future Goals**
+
+- 🗂️ **Automatic Semantic Organization**: The next major focus. Develop tools that can understand content and automatically suggest folder placements (e.g., grouping vacation photos by city).
+- ⚡ **Asynchronous Scanning & Processing**: Improve performance by moving the current synchronous scanning process to a background, asynchronous pipeline to keep the UI responsive, especially with large libraries.
+- 🎬 **Advanced Video Analysis**: Semantic video search, keyframe extraction, and scene detection.
+- 🎨 **Enhanced UI**: Add search filters, media previews, and a full browsing interface.
+- 🔌 **Custom Tool Plug-in System**: Streamline the process for users to add their own tools.
 
 ---
 
-## Getting Started
+## Getting Started 🏁
 
-### 1. Clone the Repository
+### 1\. Prerequisites ✅
+
+- [Git](https://git-scm.com/)
+- [Python 3.9+](https://www.python.org/downloads/)
+- [Groq API Key](https://console.groq.com/)
+
+### 2\. Clone the Repository 📂
+
+Open your terminal and run the following commands:
 
 ```bash
 git clone https://github.com/smv-manovihar/media-mcp.git
-cd MediaMCP
+cd media-mcp
 ```
----
 
-### 2. Install `uv` (Python package manager)
+### 3\. Install Dependencies with `uv` 📦
 
-MediaMCP uses [`uv`](https://github.com/astral-sh/uv) for dependency and environment management.
+This project uses [`uv`](https://github.com/astral-sh/uv), a fast Python package manager.
 
 ```bash
+# First, install uv
 pip install uv
-```
 
----
-
-### 3. Install Project Dependencies
-
-From the project root (`~/MediaMCP/`):
-
-```bash
+# Then, install project dependencies
 uv sync
 ```
 
-This will:
+### 4\. Configure Environment Variables 🔑
 
-- Automatically create and manage a virtual environment (✅ no need for manual `venv`)
-- Install all required dependencies
-
----
-
-### 4. Configure Environment Variables
-
-Create a `.env` file in the project root (`~/MediaMCP/.env`) and add your **Groq API key**:
+Create a `.env` file in the project root (`media-mcp/.env`).
+Now, open the `.env` file and add your Groq API key:
 
 ```env
-GROQ_API_KEY=your_api_key_here
+# Get your free key from https://console.groq.com/
+GROQ_API_KEY="your_api_key_here"
 ```
 
-⚠️ Make sure you replace `your_api_key_here` with your actual key from [Groq](https://console.groq.com/).
+### 5\. Run the Application 🚀
+
+MediaMCP requires three separate processes. Open three terminal tabs/windows and run the following commands, one in each.
+
+> **⚠️ Important**: Make sure you are in the `media-mcp` directory in each terminal.
+
+| Terminal 1: File Ops Server  | Terminal 2: Web Search Server  | Terminal 3: Client App |
+| ---------------------------- | ------------------------------ | ---------------------- |
+| `python -m servers.file_ops` | `python -m servers.search_web` | `streamlit run app.py` |
+
+After running the final command, the **MediaMCP chat interface** will open in your browser at `http://localhost:8501`. 🎉
 
 ---
 
-### 5. Start the MCP Servers
+## Contributing 🤝
 
-Run the servers in **separate terminals**:
-
-#### Terminal 1 – File Operations Server
-
-```bash
-cd ~/MediaMCP/
-python -m servers.file_ops
-```
-
-#### Terminal 2 – Web Search Server
-
-```bash
-cd ~/MediaMCP/
-python -m servers.search_web
-```
-
----
-
-### 6. Run the Client Application
-
-In a **third terminal**, start the Streamlit app:
-
-```bash
-cd ~/MediaMCP/
-streamlit run app.py
-```
-
-This launches the **MediaMCP chat interface** in your browser at [http://localhost:8501](http://localhost:8501) 🎉
-
----
-
-⚠️ **Important**
-All three processes (**file_ops server**, **search_web server**, and **Streamlit client**) must be running **simultaneously in separate terminals** for MediaMCP to function correctly.
-
----
-
-## Contributing
-
-Contributions are welcome! Feel free to open issues or PRs for bug fixes, feature requests, or documentation improvements.
-
----
+Contributions are highly welcome\! Whether it's a bug fix, a new feature, or a documentation improvement, please feel free to open an issue or submit a pull request. 💖

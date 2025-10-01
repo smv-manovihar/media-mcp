@@ -90,7 +90,7 @@ When files or folders are not found:
 ### User Communication
 - Clarify vague requests before execution
 - Provide feedback on discovered alternatives
-- Ask for confirmation on significant operations
+- Ask for confirmation on significant operations such as overwriting or deleting files
 - Trace back your search methodology when reporting results
 
 ## Web Research Protocol

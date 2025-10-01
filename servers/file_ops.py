@@ -2,6 +2,7 @@ import os
 import shutil
 from pathlib import Path
 from datetime import datetime
+from typing import Union, List, Dict
 from mcp.server.fastmcp import FastMCP
 
 from config.settings import load_config_loud
@@ -21,13 +22,18 @@ for p in config["media_index_allowed_paths"]:
     print(f"- 📁 {p}")
 
 
-def safe_path(path: str) -> Path:
+def safe_path(path: Union[str, Path]) -> Path:
     """
     Resolves a path and ensures it is within one of the ALLOWED_PATHS.
     """
-    resolved_path = (
-        Path(path).expanduser().absolute()
-    )  # Changed to absolute() to avoid following symlinks
+    if isinstance(path, str):
+        resolved_path = Path(path).expanduser().absolute()
+    else:
+        resolved_path = (
+            path.expanduser().absolute()
+            if hasattr(path, "expanduser")
+            else path.absolute()
+        )
     norm_resolved = os.path.normcase(str(resolved_path))
     for p in config["allowed_paths"]:
         norm_p = os.path.normcase(str(p))
@@ -40,6 +46,15 @@ def safe_path(path: str) -> Path:
     raise PermissionError(
         f"Access denied: {resolved_path} is not within any allowed sandbox directory."
     )
+
+
+def safe_paths(paths: Union[str, List[str]]) -> List[Path]:
+    """
+    Resolves multiple paths and ensures they are within allowed directories.
+    """
+    if isinstance(paths, str):
+        return [safe_path(paths)]
+    return [safe_path(p) for p in paths]
 
 
 @mcp.tool("allowed_paths")
@@ -97,216 +112,424 @@ def list_directory(path: str, full_path: bool = False):
 
 
 @mcp.tool("read_file")
-def read_file(path: str, full_path: bool = False):
+def read_file(
+    path: Union[str, List[str]], full_path: bool = False, max_chars: int = 1000
+):
     """
-    Read a file's contents as text.
+    Read file(s)' contents as text. Supports batch reading if path is a list.
+    Limits the content to max_chars per file to avoid exceeding context length.
     Arguments:
-    - path: The path to the file to read.
+    - path: The path to the file(s) to read (str or list of str).
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
+    - max_chars (optional): Maximum characters to read per file. Defaults to 5000.
     Returns:
-    - A dictionary containing the path and the contents of the file.
+    - A list of dictionaries containing the path and the contents of each file (truncated if needed), or error for invalid ones.
     """
     try:
-        file_path = safe_path(path)
-        if not file_path.is_file():
-            return {"error": f"{path} is not a valid file"}
-        with file_path.open("r", encoding="utf-8") as f:
-            return {
-                "path": str(file_path if full_path else file_path.name),
-                "content": f.read(),
-            }
+        file_paths = safe_paths(path)
+        results = []
+        for file_path in file_paths:
+            if not file_path.is_file():
+                results.append({"error": f"{file_path} is not a valid file"})
+                continue
+            try:
+                with file_path.open("r", encoding="utf-8") as f:
+                    content = f.read()
+                    if len(content) > max_chars:
+                        content = (
+                            content[:max_chars]
+                            + f"\n\n[Content truncated to {max_chars} characters for context limit]"
+                        )
+                    results.append(
+                        {
+                            "path": str(file_path if full_path else file_path.name),
+                            "content": content,
+                        }
+                    )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool("write_file")
 def write_file(
-    path: str,
+    path: Union[str, List[str]],
     content: str,
     append: bool = False,
     overwrite: bool = False,
     full_path: bool = False,
 ):
     """
-    Write text content to a file (overwrite if exists).
+    Write text content to file(s) (overwrite if exists). Supports batch writing the same content to multiple files.
     Arguments:
-    - path: The path to the file to write to.
-    - content: The text content to write to the file.
-    - append (optional): If True, appends to the file instead of overwriting. Defaults to False.
-    - overwrite (optional): If True, overwrites the file if it exists. Defaults to False.
+    - path: The path(s) to the file(s) to write to (str or list of str).
+    - content: The text content to write to the file(s).
+    - append (optional): If True, appends to the file(s) instead of overwriting. Defaults to False.
+    - overwrite (optional): If True, overwrites the file(s) if they exist. Defaults to False.
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
     Returns:
-    - A dictionary indicating success or failure.
+    - A list of dictionaries indicating success or failure for each file.
     """
     try:
-        file_path = safe_path(path)
-        if (not overwrite) and file_path.exists():
-            return {"error": f"File already exists at {path}"}
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        mode = "a" if append else "w"
-        with file_path.open(mode, encoding="utf-8") as f:
-            f.write(content)
-        return {
-            "success": True,
-            "path": str(file_path if full_path else file_path.name),
-        }
+        file_paths = safe_paths(path)
+        results = []
+        for file_path in file_paths:
+            if (not overwrite) and file_path.exists():
+                results.append({"error": f"File already exists at {file_path}"})
+                continue
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if append else "w"
+            try:
+                with file_path.open(mode, encoding="utf-8") as f:
+                    f.write(content)
+                results.append(
+                    {
+                        "success": True,
+                        "path": str(file_path if full_path else file_path.name),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool("delete_file")
-def delete_file(path: str, full_path: bool = False):
+def delete_file(path: Union[str, List[str]], full_path: bool = False):
     """
-    Delete a file.
+    Delete file(s). Supports batch deletion if path is a list.
     Arguments:
-    - path: The path to the file to delete.
+    - path: The path(s) to the file(s) to delete (str or list of str).
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
     Returns:
-    - A dictionary indicating success or failure.
+    - A list of dictionaries indicating success or failure for each file.
     """
     try:
-        file_path = safe_path(path)
-        if not file_path.exists():
-            return {"error": f"File not found at {path}"}
-        if not file_path.is_file():
-            return {
-                "error": f"Path is a directory, not a file. Use a directory deletion tool."
-            }
-
-        file_path.unlink()
-        return {
-            "success": True,
-            "path": str(file_path if full_path else file_path.name),
-        }
+        file_paths = safe_paths(path)
+        results = []
+        for file_path in file_paths:
+            if not file_path.exists():
+                results.append({"error": f"File not found at {file_path}"})
+                continue
+            if not file_path.is_file():
+                results.append(
+                    {
+                        "error": f"Path is a directory, not a file. Use a directory deletion tool."
+                    }
+                )
+                continue
+            try:
+                file_path.unlink()
+                results.append(
+                    {
+                        "success": True,
+                        "path": str(file_path if full_path else file_path.name),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool("create_directory")
-def create_directory(path: str, full_path: bool = False):
+def create_directory(path: Union[str, List[str]], full_path: bool = False):
     """
-    Create a directory (including parents).
+    Create directory(ies) (including parents). Supports batch creation if path is a list.
     Arguments:
-    - path: The path to the directory to create.
+    - path: The path(s) to the directory(ies) to create (str or list of str).
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
     Returns:
-    - A dictionary indicating success or failure.
+    - A list of dictionaries indicating success or failure for each directory.
     """
     try:
-        dir_path = safe_path(path)
-        dir_path.mkdir(parents=True, exist_ok=True)
-        return {"success": True, "path": str(dir_path if full_path else dir_path.name)}
+        dir_paths = safe_paths(path)
+        results = []
+        for dir_path in dir_paths:
+            try:
+                dir_path.mkdir(parents=True, exist_ok=True)
+                results.append(
+                    {
+                        "success": True,
+                        "path": str(dir_path if full_path else dir_path.name),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool("delete_directory")
-def delete_directory(path: str, full_path: bool = False):
+def delete_directory(path: Union[str, List[str]], full_path: bool = False):
     """
-    Delete an empty directory.
+    Delete empty directory(ies). Supports batch deletion if path is a list.
     Arguments:
-    - path: The path to the directory to delete.
+    - path: The path(s) to the directory(ies) to delete (str or list of str).
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
     Returns:
-    - A dictionary indicating success or failure.
+    - A list of dictionaries indicating success or failure for each directory.
     """
     try:
-        dir_path = safe_path(path)
-        dir_path.rmdir()
-        return {"success": True, "path": str(dir_path if full_path else dir_path.name)}
+        dir_paths = safe_paths(path)
+        results = []
+        for dir_path in dir_paths:
+            try:
+                dir_path.rmdir()
+                results.append(
+                    {
+                        "success": True,
+                        "path": str(dir_path if full_path else dir_path.name),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool("delete_directory_recursive")
-def delete_directory_recursive(path: str, full_path: bool = False):
+def delete_directory_recursive(path: Union[str, List[str]], full_path: bool = False):
     """
-    Delete a directory and all of its contents (⚠️ irreversible).
+    Delete directory(ies) and all of their contents (⚠️ irreversible). Supports batch if path is a list.
     Arguments:
-    - path: The path to the directory to delete.
+    - path: The path(s) to the directory(ies) to delete (str or list of str).
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
     Returns:
-    - A dictionary indicating success or failure.
+    - A list of dictionaries indicating success or failure for each directory.
     """
     try:
-        dir_path = safe_path(path)
-        shutil.rmtree(dir_path)
-        return {"success": True, "path": str(dir_path if full_path else dir_path.name)}
+        dir_paths = safe_paths(path)
+        results = []
+        for dir_path in dir_paths:
+            try:
+                shutil.rmtree(dir_path)
+                results.append(
+                    {
+                        "success": True,
+                        "path": str(dir_path if full_path else dir_path.name),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool("copy_file")
-def copy_file(src: str, dest: str, full_path: bool = False):
+def copy_file(
+    src: Union[str, List[str]], dest: Union[str, Path], full_path: bool = False
+):
     """
-    Copy a file to a new location.
+    Copy file(s) to a new location. If src is a list, copies all to dest directory.
     Arguments:
-    - src: The path to the file to copy.
-    - dest: The path to the new location for the file.
+    - src: The path(s) to the file(s) to copy (str or list of str).
+    - dest: The path to the new location or directory for the file(s).
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
     Returns:
-    - A dictionary indicating success or failure.
+    - A list of dictionaries indicating success or failure for each copy operation.
     """
     try:
-        src_path = safe_path(src)
+        src_paths = safe_paths(src)
         dest_path = safe_path(dest)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_path, dest_path)
-        return {
-            "success": True,
-            "destination": str(dest_path if full_path else dest_path.name),
-        }
+        if len(src_paths) > 1:
+            if not dest_path.is_dir():
+                dest_path.mkdir(parents=True, exist_ok=True)
+        results = []
+        for src_path in src_paths:
+            if not src_path.is_file():
+                results.append({"error": f"{src_path} is not a file"})
+                continue
+            try:
+                final_dest = (
+                    dest_path / src_path.name if dest_path.is_dir() else dest_path
+                )
+                final_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_path, final_dest)
+                results.append(
+                    {
+                        "success": True,
+                        "destination": str(
+                            final_dest if full_path else final_dest.name
+                        ),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool("move_file")
-def move_file(src: str, dest: str, full_path: bool = False):
+def move_file(
+    src: Union[str, List[str]], dest: Union[str, Path], full_path: bool = False
+):
     """
-    Move (or rename) a file.
+    Move (or rename) file(s). If src is a list, moves all to dest directory.
     Arguments:
-    - src: The path to the file to move.
-    - dest: The path to the new location for the file.
+    - src: The path(s) to the file(s) to move (str or list of str).
+    - dest: The path to the new location or directory for the file(s).
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
     Returns:
-    - A dictionary indicating success or failure.
+    - A list of dictionaries indicating success or failure for each move operation.
     """
     try:
-        src_path = safe_path(src)
+        src_paths = safe_paths(src)
         dest_path = safe_path(dest)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(src_path, dest_path)
-        return {
-            "success": True,
-            "destination": str(dest_path if full_path else dest_path.name),
-        }
+        if len(src_paths) > 1:
+            if not dest_path.is_dir():
+                dest_path.mkdir(parents=True, exist_ok=True)
+        results = []
+        for src_path in src_paths:
+            if not src_path.is_file():
+                results.append({"error": f"{src_path} is not a file"})
+                continue
+            try:
+                final_dest = (
+                    dest_path / src_path.name if dest_path.is_dir() else dest_path
+                )
+                final_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(src_path, final_dest)
+                results.append(
+                    {
+                        "success": True,
+                        "destination": str(
+                            final_dest if full_path else final_dest.name
+                        ),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool("batch_move_files")
+def batch_move_files(moves: List[Dict[str, str]], full_path: bool = False):
+    """
+    Batch move multiple files to their individual destinations. Each move is specified as a dict with 'src' and 'dest' keys.
+    Arguments:
+    - moves: A list of dictionaries, each containing 'src' (source path) and 'dest' (destination path).
+    - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
+    Returns:
+    - A list of dictionaries indicating success or failure for each move operation.
+    """
+    try:
+        results = []
+        for move in moves:
+            src = move.get("src")
+            dest = move.get("dest")
+            if not src or not dest:
+                results.append({"error": "Missing 'src' or 'dest' in move dict"})
+                continue
+            try:
+                src_path = safe_path(src)
+                dest_path = safe_path(dest)
+                if not src_path.is_file():
+                    results.append({"error": f"{src_path} is not a file"})
+                    continue
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(src_path, dest_path)
+                results.append(
+                    {
+                        "success": True,
+                        "source": str(src_path if full_path else src_path.name),
+                        "destination": str(dest_path if full_path else dest_path.name),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool("move_directory")
+def move_directory(
+    src: Union[str, List[str]], dest: Union[str, Path], full_path: bool = False
+):
+    """
+    Move (or rename) directory(ies). If src is a list, moves all to dest directory.
+    Arguments:
+    - src: The path(s) to the directory(ies) to move (str or list of str).
+    - dest: The path to the new location or directory for the directory(ies).
+    - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
+    Returns:
+    - A list of dictionaries indicating success or failure for each move operation.
+    """
+    try:
+        src_paths = safe_paths(src)
+        dest_path = safe_path(dest)
+        if len(src_paths) > 1:
+            if not dest_path.is_dir():
+                dest_path.mkdir(parents=True, exist_ok=True)
+        results = []
+        for src_path in src_paths:
+            if not src_path.is_dir():
+                results.append({"error": f"{src_path} is not a directory"})
+                continue
+            try:
+                final_dest = (
+                    dest_path / src_path.name if dest_path.is_dir() else dest_path
+                )
+                final_dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(src_path, final_dest)
+                results.append(
+                    {
+                        "success": True,
+                        "destination": str(
+                            final_dest if full_path else final_dest.name
+                        ),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 
 
 @mcp.tool("get_file_info")
-def get_file_info(path: str, full_path: bool = False):
+def get_file_info(path: Union[str, List[str]], full_path: bool = False):
     """
-    Get file metadata (size, modified time, created time).
+    Get file(s) metadata (size, modified time, created time). Supports batch if path is a list.
     Arguments:
-    - path: The path to the file to get metadata for.
+    - path: The path(s) to the file(s) to get metadata for (str or list of str).
     - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
     Returns:
-    - A dictionary containing the path, file type, size, modified time, and created time.
+    - A list of dictionaries containing the path, file type, size, modified time, and created time for each.
     """
     try:
-        file_path = safe_path(path)
-        if not file_path.exists():
-            return {"error": f"{path} does not exist"}
-        stat = file_path.stat()
-        return {
-            "path": str(file_path if full_path else file_path.name),
-            "is_file": file_path.is_file(),
-            "is_dir": file_path.is_dir(),
-            "size_bytes": stat.st_size,
-            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            "created": datetime.fromtimestamp(stat.st_ctime).isoformat(),
-        }
+        file_paths = safe_paths(path)
+        results = []
+        for file_path in file_paths:
+            if not file_path.exists():
+                results.append({"error": f"{file_path} does not exist"})
+                continue
+            try:
+                stat = file_path.stat()
+                results.append(
+                    {
+                        "path": str(file_path if full_path else file_path.name),
+                        "is_file": file_path.is_file(),
+                        "is_dir": file_path.is_dir(),
+                        "size_bytes": stat.st_size,
+                        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                        "created": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                    }
+                )
+            except Exception as e:
+                results.append({"error": str(e)})
+        return {"results": results}
     except Exception as e:
         return {"error": str(e)}
 

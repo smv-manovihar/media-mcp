@@ -63,20 +63,20 @@ def embed(paths: List[str], batch: int = 32) -> np.ndarray:
 
 
 def scan_images(scan_paths: List[str], silent: bool = False) -> Dict:
-    fileops_utils.scan_files(scan_paths, silent=silent)
     found = list_images(scan_paths)
     new_paths, new_hashes, new_metadata = [], [], []
     updated, deletions, skipped_for_exif_error = 0, [], 0
 
     with database.db.cursor() as cur:
-        cur.execute("SELECT hash, path FROM files WHERE file_type = 'image'")
-        known: Dict[str, str] = dict(cur.fetchall())
+        cur.execute("SELECT hash, path, id FROM files WHERE file_type = 'image'")
+        known_rows = cur.fetchall()
+        known = {row[0]: (row[1], row[2]) for row in known_rows}
         iterable = tqdm(found, desc="Scanning images", disable=silent)
         for fp in iterable:
             h = sha256_file(fp)
             abs_fp = os.path.abspath(fp)
             if h in known:
-                if abs_fp != known[h]:
+                if abs_fp != known[h][0]:
                     cur.execute(
                         "UPDATE files SET path=?, updated_at=? WHERE hash=?",
                         (abs_fp, datetime.now(timezone.utc).isoformat(), h),
@@ -157,6 +157,71 @@ def scan_images(scan_paths: List[str], silent: bool = False) -> Dict:
                 print(f"✓ Removed {len(deletions)} deleted images")
         if updated and not silent:
             print(f"✓ Updated {updated} moved images")
+
+        cur.execute("SELECT file_id FROM images")
+        existing_image_file_ids = set(r[0] for r in cur.fetchall())
+        missing_file_rows = [
+            (h, os.path.abspath(path), file_id)
+            for h, (path, file_id) in known.items()
+            if file_id not in existing_image_file_ids and os.path.exists(path)
+        ]
+        reindexed_count = 0
+        if missing_file_rows:
+            missing_hashes = [r[0] for r in missing_file_rows]
+            missing_paths = [r[1] for r in missing_file_rows]
+            missing_metadata = []
+            for p in missing_paths:
+                metadata = exif_utils.get_exif_data(p)
+                if "error" in metadata:
+                    skipped_for_exif_error += 1
+                    if not silent:
+                        print(f"\nWarning: Could not read EXIF for {p}.")
+                    missing_metadata.append({})
+                else:
+                    missing_metadata.append(metadata)
+            if not silent:
+                print(f"Embedding {len(missing_paths)} missing images for indexing...")
+            vecs = embed(missing_paths)
+            if vecs.shape[0] != 0:
+                with database.chroma_lock:
+                    database.chroma_coll.add(ids=missing_hashes, embeddings=vecs)
+            now = datetime.now(timezone.utc).isoformat()
+            for (_, path, file_id), meta in zip(missing_file_rows, missing_metadata):
+                cur.execute(
+                    """INSERT INTO images (file_id, make, model, software,
+                    width, height, orientation, datetime_original, datetime_digitized,
+                    exposure_time, f_number, iso, focal_length, flash,
+                    latitude, longitude, altitude, gps_timestamp,
+                    location_display_name, location_country, location_state, location_city, location_postcode)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        file_id,
+                        meta.get("make"),
+                        meta.get("model"),
+                        meta.get("software"),
+                        meta.get("width"),
+                        meta.get("height"),
+                        meta.get("orientation"),
+                        meta.get("datetime_original"),
+                        meta.get("datetime_digitized"),
+                        meta.get("exposure_time"),
+                        meta.get("f_number"),
+                        meta.get("iso"),
+                        meta.get("focal_length"),
+                        meta.get("flash"),
+                        meta.get("latitude"),
+                        meta.get("longitude"),
+                        meta.get("altitude"),
+                        meta.get("gps_timestamp"),
+                        meta.get("location_display_name"),
+                        meta.get("location_country"),
+                        meta.get("location_state"),
+                        meta.get("location_city"),
+                        meta.get("location_postcode"),
+                    ),
+                )
+                reindexed_count += 1
+
     return {
         "success": True,
         "total_media_count": len(found),
@@ -164,6 +229,7 @@ def scan_images(scan_paths: List[str], silent: bool = False) -> Dict:
         "updated_media_count": updated,
         "deleted_media_count": len(deletions),
         "skipped_media_count": skipped_for_exif_error,
+        "reindexed_images_count": reindexed_count,
     }
 
 
@@ -255,20 +321,22 @@ def query_by_metadata(
     min_width: int = None,
     min_height: int = None,
     has_gps: bool = None,
+    page: int = 1,
+    page_size: int = 10,
 ) -> List[Dict]:
     conditions, params = [], []
     if make:
-        conditions.append("i.make LIKE ?")
-        params.append(f"%{make}%")
+        conditions.append("LOWER(i.make) LIKE ?")
+        params.append(f"%{make.lower()}%")
     if model:
-        conditions.append("i.model LIKE ?")
-        params.append(f"%{model}%")
+        conditions.append("LOWER(i.model) LIKE ?")
+        params.append(f"%{model.lower()}%")
     if country:
-        conditions.append("i.location_country LIKE ?")
-        params.append(f"%{country}%")
+        conditions.append("LOWER(i.location_country) LIKE ?")
+        params.append(f"%{country.lower()}%")
     if city:
-        conditions.append("i.location_city LIKE ?")
-        params.append(f"%{city}%")
+        conditions.append("LOWER(i.location_city) LIKE ?")
+        params.append(f"%{city.lower()}%")
     if min_width:
         conditions.append("i.width >= ?")
         params.append(min_width)
@@ -286,13 +354,12 @@ def query_by_metadata(
         cur.execute(
             f"SELECT f.hash, f.path, i.make, i.model, i.width, i.height, i.latitude, i.longitude, i.location_city, i.location_country, i.datetime_original "
             + f"FROM files f JOIN images i ON f.id = i.file_id "
-            + f"WHERE {where_clause} LIMIT 100",
+            + f"WHERE {where_clause} LIMIT {page_size} OFFSET {(page - 1) * page_size}",
             params,
         )
         rows = cur.fetchall()
     return [
         {
-            "hash": r[0],
             "path": r[1],
             "make": r[2],
             "model": r[3],

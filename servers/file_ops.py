@@ -47,7 +47,7 @@ def safe_path(path: Union[str, Path]) -> Path:
         if norm_resolved == norm_p or norm_resolved.startswith(prefix):
             return resolved_path
     raise PermissionError(
-        f"Access denied: {resolved_path} is not within any allowed sandbox directory."
+        f"Access denied: {resolved_path} is not within any allowed sandbox directory. Please check your Allowed paths for file indexing configuration."
     )
 
 
@@ -63,9 +63,8 @@ def safe_paths(paths: Union[str, List[str]]) -> List[Path]:
 @mcp.tool("allowed_paths")
 def allowed_paths():
     """
-    Get the list of allowed directories, You are only allowed in these paths and their subdirectories.
-    Returns:
-    - A list of strings representing the paths.
+    Returns the list of allowed directories (and subdirs) for operations, plus media-indexed paths.
+    Returns: Dict with 'allowed_paths' and 'media_indexed_paths' as lists of strings.
     """
     return {
         "allowed_paths": [str(p) for p in config["allowed_paths"]],
@@ -76,8 +75,8 @@ def allowed_paths():
 @mcp.tool("current_directory")
 def current_directory():
     """
-    Get the primary working directory for the agent.
-    Returns the first path from the list of allowed sandbox directories.
+    Returns the primary working directory (first allowed path) as a dict with 'path' key.
+    Returns error dict if not in allowed paths.
     """
     try:
         cwd = safe_path(str(Path.cwd()))
@@ -89,12 +88,11 @@ def current_directory():
 @mcp.tool("list_directory")
 def list_directory(path: str, full_path: bool = False):
     """
-    List immediate contents of a directory (non-recursive).
-    Arguments:
-    - path: The path to the directory to list.
-    - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
-    Returns:
-    - A list of dictionaries containing the name and type of each item.
+    Lists immediate directory contents (non-recursive).
+    Args:
+    - path (str, required): Directory path.
+    - full_path (bool, optional): Return absolute paths (default: False, relative names).
+    Returns: Dict with 'items' list of dicts {'name': str, 'type': 'file'|'directory'}, or 'error'.
     """
     try:
         base = safe_path(path)
@@ -117,28 +115,30 @@ def list_directory(path: str, full_path: bool = False):
 @mcp.tool("create_directory")
 def create_directory(path: Union[str, List[str]], full_path: bool = False):
     """
-    Create directory(ies) (including parents). Supports batch creation if path is a list.
-    Arguments:
-    - path: The path(s) to the directory(ies) to create (str or list of str).
-    - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
-    Returns:
-    - A list of dictionaries indicating success or failure for each directory.
+    Creates directory(ies), including parents. Supports batch via list.
+    Args:
+    - path (str|List[str], required): Path(s) to create.
+    - full_path (bool, optional): Return absolute paths in failed (default: False).
+    Returns: {"success": True} on full success, else {"success_count": int, "failed": list of dicts {'path': str, 'error': str}} or {'error': str}.
     """
     try:
         dir_paths = safe_paths(path)
-        results = []
+        failed = []
         for dir_path in dir_paths:
             try:
                 dir_path.mkdir(parents=True, exist_ok=True)
-                results.append(
+            except Exception as e:
+                failed.append(
                     {
-                        "success": True,
                         "path": str(dir_path if full_path else dir_path.name),
+                        "error": str(e),
                     }
                 )
-            except Exception as e:
-                results.append({"error": str(e)})
-        return {"results": results}
+        if not failed:
+            return {"success": True}
+        else:
+            success_count = len(dir_paths) - len(failed)
+            return {"success_count": success_count, "failed": failed}
     except Exception as e:
         return {"error": str(e)}
 
@@ -148,14 +148,12 @@ def read_file(
     path: Union[str, List[str]], full_path: bool = False, max_chars: int = 1000
 ):
     """
-    Read file(s)' contents as text. Supports batch reading if path is a list.
-    Limits the content to max_chars per file to avoid exceeding context length.
-    Arguments:
-    - path: The path to the file(s) to read (str or list of str).
-    - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
-    - max_chars (optional): Maximum characters to read per file. Defaults to 1000.
-    Returns:
-    - A list of dictionaries containing the path and the contents of each file (truncated if needed), or error for invalid ones.
+    Reads text file(s) contents, truncated to max_chars. Supports batch via list.
+    Args:
+    - path (str|List[str], required): File path(s).
+    - full_path (bool, optional): Return absolute paths (default: False).
+    - max_chars (int, optional): Max chars per file (default: 1000).
+    Returns: Dict with 'results' list of dicts {'path': str, 'content': str} or {'error': str}.
     """
     try:
         file_paths = safe_paths(path)
@@ -194,21 +192,20 @@ def write_file(
     full_path: bool = False,
 ):
     """
-    Write text content to a file. This will remove the old DB entry and re-scan the file to get the new hash.
-    Arguments:
-    - path: The path to the file to write to (str).
-    - content: The text content to write to the file.
-    - append (optional): If True, appends to the file instead of overwriting. Defaults to False.
-    - overwrite (optional): If True, overwrites the file if it exists. Defaults to False.
-    - full_path (optional): If True, returns the absolute path. Defaults to False.
-    Returns:
-    - A dictionary indicating success or failure.
+    Writes text to file. Requires append or overwrite if file exists.
+    Args:
+    - path (str, required): File path.
+    - content (str, required): Text to write.
+    - append (bool, optional): Append if True (default: False).
+    - overwrite (bool, optional): Overwrite if True (default: False).
+    - full_path (bool, optional): Return absolute path in error (default: False).
+    Returns: {"success": True} or {'error': str}.
     """
     try:
         file_path = safe_path(path)
         if (not overwrite and not append) and file_path.exists():
             return {
-                "error": f"File already exists at {file_path}. Use overwrite=True or append=True."
+                "error": f"File already exists at {str(file_path if full_path else file_path.name)}. Use overwrite=True or append=True."
             }
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -228,10 +225,7 @@ def write_file(
             image_utils.scan_images([str(file_path)], silent=True)
         else:
             file_utils.scan_files([str(file_path)], silent=True)
-        return {
-            "success": True,
-            "path": str(file_path if full_path else file_path.name),
-        }
+        return {"success": True}
     except Exception as e:
         return {"error": str(e)}
 
@@ -241,28 +235,25 @@ def delete(
     path: Union[str, List[str]], recursive: bool = False, full_path: bool = False
 ):
     """
-    Deletes file(s) or directory(ies). Supports batch deletion if path is a list.
-
-    - For files, it deletes them directly.
-    - For directories, behavior depends on the 'recursive' flag:
-      - If recursive=False (default): Deletes ONLY empty directories.
-      - If recursive=True: Deletes directories and ALL their contents (⚠️ irreversible).
-
-    Arguments:
-    - path: The path(s) to the item(s) to delete (str or list of str).
-    - recursive (optional): If True, allows deletion of non-empty directories. Defaults to False.
-    - full_path (optional): If True, returns absolute paths. Defaults to False.
-
-    Returns:
-    - A dictionary containing a list of results for each deletion.
+    Deletes file(s)/dir(s). For dirs: recursive=True deletes contents (irreversible).
+    Args:
+    - path (str|List[str], required): Path(s) to delete.
+    - recursive (bool, optional): Delete non-empty dirs (default: False, only empty dirs).
+    - full_path (bool, optional): Return absolute paths in failed (default: False).
+    Returns: {"success": True} on full success, else {"success_count": int, "failed": list of dicts {'path': str, 'error': str}} or {'error': str}.
     """
     try:
         paths_to_delete = safe_paths(path)
-        results = []
+        failed = []
         for p in paths_to_delete:
             try:
                 if not p.exists():
-                    results.append({"error": f"Path not found: {p}"})
+                    failed.append(
+                        {
+                            "path": str(p if full_path else p.name),
+                            "error": "Path not found",
+                        }
+                    )
                     continue
 
                 # --- DB UPDATE: Find records to delete before the filesystem operation ---
@@ -302,18 +293,24 @@ def delete(
                             [(h,) for h in hashes_to_delete],
                         )
 
-                results.append(
-                    {"success": True, "deleted": str(p if full_path else p.name)}
-                )
-
             except OSError as e:
                 error_msg = str(e)
                 if "Directory not empty" in error_msg and not recursive:
-                    error_msg = f"Directory '{p.name}' is not empty. Use recursive=True to delete it."
-                results.append({"error": error_msg})
+                    error_msg = (
+                        f"Directory is not empty. Use recursive=True to delete it."
+                    )
+                failed.append(
+                    {"path": str(p if full_path else p.name), "error": error_msg}
+                )
             except Exception as e:
-                results.append({"error": str(e)})
-        return {"results": results}
+                failed.append(
+                    {"path": str(p if full_path else p.name), "error": str(e)}
+                )
+        if not failed:
+            return {"success": True}
+        else:
+            success_count = len(paths_to_delete) - len(failed)
+            return {"success_count": success_count, "failed": failed}
     except Exception as e:
         return {"error": str(e)}
 
@@ -323,15 +320,12 @@ def copy_file(
     src: Union[str, List[str]], dest: Union[str, Path], full_path: bool = False
 ):
     """
-    Copy file(s) to a new location and updates the database index to the new path.
-    If src is a list, copies all to the dest directory.
-    Note: This re-indexes the file at the new location; the original path will be removed from the index.
-    Arguments:
-    - src: The path(s) to the file(s) to copy (str or list of str).
-    - dest: The path to the new location or directory for the file(s).
-    - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
-    Returns:
-    - A list of dictionaries indicating success or failure for each copy operation.
+    Copies file(s) to dest. For multiple src, dest must be dir.
+    Args:
+    - src (str|List[str], required): Source file path(s).
+    - dest (str|Path, required): Destination path or dir.
+    - full_path (bool, optional): Return absolute paths in failed (default: False).
+    Returns: {"success": True} on full success, else {"success_count": int, "failed": list of dicts {'src': str, 'error': str}} or {'error': str}.
     """
     try:
         src_paths = safe_paths(src)
@@ -339,10 +333,15 @@ def copy_file(
         if len(src_paths) > 1:
             dest_path.mkdir(parents=True, exist_ok=True)
 
-        results = []
+        failed = []
         for src_path in src_paths:
             if not src_path.is_file():
-                results.append({"error": f"{src_path} is not a file"})
+                failed.append(
+                    {
+                        "src": str(src_path if full_path else src_path.name),
+                        "error": "Not a file",
+                    }
+                )
                 continue
             try:
                 final_dest = (
@@ -359,17 +358,18 @@ def copy_file(
                     image_utils.scan_images([str(final_dest)], silent=True)
                 else:
                     file_utils.scan_files([str(final_dest)], silent=True)
-                results.append(
+            except Exception as e:
+                failed.append(
                     {
-                        "success": True,
-                        "destination": str(
-                            final_dest if full_path else final_dest.name
-                        ),
+                        "src": str(src_path if full_path else src_path.name),
+                        "error": str(e),
                     }
                 )
-            except Exception as e:
-                results.append({"error": str(e)})
-        return {"results": results}
+        if not failed:
+            return {"success": True}
+        else:
+            success_count = len(src_paths) - len(failed)
+            return {"success_count": success_count, "failed": failed}
     except Exception as e:
         return {"error": str(e)}
 
@@ -377,22 +377,15 @@ def copy_file(
 @mcp.tool("move")
 def move(src: Union[str, List[str]], dest: Union[str, Path], full_path: bool = False):
     """
-    Moves or renames files and directories.
-
-    - To move a single item: move(src='file.txt', dest='dir/')
-    - To rename a single item: move(src='old.txt', dest='new.txt')
-    - To move multiple items into one directory: move(src=['a.txt', 'b.txt'], dest='dir/')
-
-    Arguments:
-    - src: A source path or a list of source paths.
-    - dest: The destination path or directory.
-    - full_path (optional): If True, returns absolute paths. Defaults to False.
-
-    Returns:
-    - A dictionary containing a list of results for each move operation.
+    Moves/renames file(s)/dir(s). For multiple src, dest must be dir.
+    Args:
+    - src (str|List[str], required): Source path(s).
+    - dest (str|Path, required): Destination path or dir.
+    - full_path (bool, optional): Return absolute paths in failed (default: False).
+    Returns: {"success": True} on full success, else {"success_count": int, "failed": list of dicts {'src': str, 'error': str}} or {'error': str}.
     """
     try:
-        results = []
+        failed = []
         src_paths, dest_path = safe_paths(src), safe_path(dest)
 
         if len(src_paths) > 1:
@@ -404,7 +397,12 @@ def move(src: Union[str, List[str]], dest: Union[str, Path], full_path: bool = F
 
         for src_path in src_paths:
             if not src_path.exists():
-                results.append({"error": f"Source {src_path} does not exist."})
+                failed.append(
+                    {
+                        "src": str(src_path if full_path else src_path.name),
+                        "error": "Source does not exist.",
+                    }
+                )
                 continue
             try:
                 final_dest = (
@@ -435,18 +433,18 @@ def move(src: Union[str, List[str]], dest: Union[str, Path], full_path: bool = F
                             ),
                         )
 
-                results.append(
+            except Exception as e:
+                failed.append(
                     {
-                        "success": True,
-                        "source": str(src_path.name),
-                        "destination": str(
-                            final_dest if full_path else final_dest.name
-                        ),
+                        "src": str(src_path if full_path else src_path.name),
+                        "error": str(e),
                     }
                 )
-            except Exception as e:
-                results.append({"error": f"Failed to move '{src_path}': {e}"})
-        return {"results": results}
+        if not failed:
+            return {"success": True}
+        else:
+            success_count = len(src_paths) - len(failed)
+            return {"success_count": success_count, "failed": failed}
     except Exception as e:
         return {"error": str(e)}
 
@@ -454,26 +452,28 @@ def move(src: Union[str, List[str]], dest: Union[str, Path], full_path: bool = F
 @mcp.tool("batch_move")
 def batch_move(moves: List[Dict[str, str]], full_path: bool = False):
     """
-    Batch moves multiple files or directories to their individual destinations.
-
-    Arguments:
-    - moves: A list of dictionaries, each with 'src' and 'dest' keys.
-    - full_path (optional): If True, returns absolute paths. Defaults to False.
-
-    Returns:
-    - A dictionary containing a list of results for each move operation.
+    Batch moves files/dirs to individual dests.
+    Args:
+    - moves (List[Dict[str, str]], required): List of {'src': str, 'dest': str}.
+    - full_path (bool, optional): Return absolute paths in failed (default: False).
+    Returns: {"success": True} on full success, else {"success_count": int, "failed": list of dicts {'src': str, 'error': str}} or {'error': str}.
     """
     try:
-        results = []
+        failed = []
         for item in moves:
             item_src, item_dest = item.get("src"), item.get("dest")
             if not item_src or not item_dest:
-                results.append({"error": "Missing 'src' or 'dest' in a batch item."})
+                failed.append({"error": "Missing 'src' or 'dest' in a batch item."})
                 continue
             try:
                 src_path, dest_path = safe_path(item_src), safe_path(item_dest)
                 if not src_path.exists():
-                    results.append({"error": f"Source {src_path} does not exist."})
+                    failed.append(
+                        {
+                            "src": str(src_path if full_path else src_path.name),
+                            "error": "Source does not exist.",
+                        }
+                    )
                     continue
 
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -500,16 +500,13 @@ def batch_move(moves: List[Dict[str, str]], full_path: bool = False):
                             ),
                         )
 
-                results.append(
-                    {
-                        "success": True,
-                        "source": str(src_path if full_path else src_path.name),
-                        "destination": str(dest_path if full_path else dest_path.name),
-                    }
-                )
             except Exception as e:
-                results.append({"error": f"Failed to move '{item_src}': {e}"})
-        return {"results": results}
+                failed.append({"src": item_src, "error": str(e)})
+        if not failed:
+            return {"success": True}
+        else:
+            success_count = len(moves) - len(failed)
+            return {"success_count": success_count, "failed": failed}
     except Exception as e:
         return {"error": str(e)}
 
@@ -517,12 +514,11 @@ def batch_move(moves: List[Dict[str, str]], full_path: bool = False):
 @mcp.tool("get_file_info")
 def get_file_info(path: Union[str, List[str]], full_path: bool = False):
     """
-    Get file(s) metadata (size, modified time, created time). Supports batch if path is a list.
-    Arguments:
-    - path: The path(s) to the file(s) to get metadata for (str or list of str).
-    - full_path (optional): If True, returns absolute paths. Defaults to False (relative).
-    Returns:
-    - A list of dictionaries containing the path, file type, size, modified time, and created time for each.
+    Gets metadata for file(s)/dir(s): size, modified/created times, type. Supports batch.
+    Args:
+    - path (str|List[str], required): Path(s) to query.
+    - full_path (bool, optional): Return absolute paths (default: False).
+    Returns: Dict with 'results' list of dicts {'path': str, 'is_file': bool, 'is_dir': bool, 'size_bytes': int, 'modified': str, 'created': str} or {'error': str}.
     """
     try:
         file_paths = safe_paths(path)
@@ -557,41 +553,37 @@ def search_files(
     extension: str = None,
     recursive: bool = True,
     full_path: bool = False,
+    page: int = 1,
+    page_size: int = 10,
 ):
-    """
-    Search for files inside a directory using the FAST database index.
-    Arguments:
-    - path: The directory to start the search from.
-    - name (optional): Match a substring in the filename (case-insensitive).
-    - extension (optional): Filter by file extension (e.g., '.txt', 'py').
-    - recursive (optional): If True, searches subdirectories. Defaults to True.
-    - full_path (optional): If True, returns absolute paths. Defaults to False.
-    Returns:
-    - A list of matching file paths.
-    """
     try:
         base = safe_path(path)
         if not base.is_dir():
             return {"error": f"{path} is not a valid directory"}
 
-        conditions = ["path LIKE ?"]
-        params = [f"{base}%"]
+        conditions = ["LOWER(path) LIKE ?"]
+        params = [f"{str(base).lower()}%"]
 
         if name:
-            conditions.append("path LIKE ?")
-            params.append(f"%{name}%")
+            conditions.append("LOWER(path) LIKE ?")
+            params.append(f"%{name.lower()}%")
 
         if extension:
             if not extension.startswith("."):
                 extension = "." + extension
-            conditions.append("path LIKE ?")
-            params.append(f"%{extension}")
+            conditions.append("LOWER(path) LIKE ?")
+            params.append(f"%{extension.lower()}")
 
         if not recursive:
+            # Match paths with exactly one level deeper (avoid double %)
             conditions.append("path NOT LIKE ?")
             params.append(f"{base}{os.sep}%{os.sep}%")
 
-        query = f"SELECT path FROM files WHERE {' AND '.join(conditions)} LIMIT 200"
+        query = f"""
+            SELECT path FROM files
+            WHERE {' AND '.join(conditions)}
+            LIMIT {page_size} OFFSET {(page - 1) * page_size}
+        """
 
         with database.db.cursor() as cur:
             cur.execute(query, params)
@@ -603,6 +595,7 @@ def search_files(
             results.append(str(p if full_path else p.relative_to(base)))
 
         return {"results": results}
+
     except Exception as e:
         return {"error": str(e)}
 
@@ -611,12 +604,11 @@ def search_files(
 @mcp.tool("search_image_by_text")
 def search_image_by_text(query: str, top_k: int = 5):
     """
-    Search for images by text query semantically.
-    Arguments:
-    - query: The text query to search for.
-    - top_k (optional): The number of results to return. Defaults to 5.
-    Returns:
-    - A list of absolute paths to the images.
+    Semantically searches indexed images by text query.
+    Args:
+    - query (str, required): Text description.
+    - top_k (int, optional): Max results (default: 5).
+    Returns: List of absolute image paths.
     """
     res = image_utils.search_by_text(query, top_k)
     return [str(p["path"]) for p in res]
@@ -625,15 +617,54 @@ def search_image_by_text(query: str, top_k: int = 5):
 @mcp.tool("search_by_image")
 def search_by_image(path: str, top_k: int = 5):
     """
-    Search for similar images by providing the path to an image.
-    Arguments:
-    - path: The path to the image to search for.
-    - top_k (optional): The number of results to return. Defaults to 5.
-    Returns:
-    - A list containing the absolute paths to the images.
+    Finds similar indexed images to a given image.
+    Args:
+    - path (str, required): Query image path.
+    - top_k (int, optional): Max results (default: 5).
+    Returns: Dict with 'results' list of absolute image paths.
     """
     res = image_utils.search_by_image(path, top_k)
     return {"results": [str(p["path"]) for p in res]}
+
+
+@mcp.tool("search_image_by_metadata")
+def search_image_by_metadata(
+    make: str = None,
+    model: str = None,
+    country: str = None,
+    city: str = None,
+    min_width: int = None,
+    min_height: int = None,
+    has_gps: bool = None,
+    page: int = 1,
+    page_size: int = 10,
+):
+    """
+    Searches indexed images by EXIF/metadata filters.
+    Args (all optional):
+    - make (str): Camera make.
+    - model (str): Camera model.
+    - country (str): Location country.
+    - city (str): Location city.
+    - min_width (int): Min image width.
+    - min_height (int): Min image height.
+    - has_gps (bool): Has GPS data.
+    - page (int): Page number (default: 1).
+    - page_size (int): Page size (default: 10).
+    Returns: List of absolute image paths.
+    """
+    res = image_utils.query_by_metadata(
+        make=make,
+        model=model,
+        country=country,
+        city=city,
+        min_width=min_width,
+        min_height=min_height,
+        has_gps=has_gps,
+        page=page,
+        page_size=page_size,
+    )
+    return [str(p["path"]) for p in res]
 
 
 def main():

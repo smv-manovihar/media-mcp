@@ -1,6 +1,7 @@
 import os, glob, hashlib
 from typing import List
 from pathlib import Path
+from config.settings import Config, should_exclude
 
 
 def sha256_file(fp: str, chunk: int = 1 << 20) -> str:

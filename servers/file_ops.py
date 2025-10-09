@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Union, List, Dict
 from mcp.server.fastmcp import FastMCP
 
-from config.settings import load_config_loud
+from config.settings import load_config
 from utils import database
 from helpers import helpers
 import utils.image_search_utils as image_utils
@@ -13,15 +13,15 @@ import utils.fileops_utils as file_utils
 
 mcp = FastMCP("file_management", port=8000)
 
-config = load_config_loud()
-# --- Create the directories if they don't exist ---
+config = load_config(verbose=True)
+
 print("Allowed paths:")
-for p in config["allowed_paths"]:
+for p in config.user_allowed_paths:
     print(f"- 📁 {p}")
     p.mkdir(exist_ok=True)
 
 print("Media indexed paths:")
-for p in config["media_index_allowed_paths"]:
+for p in config.user_media_index_allowed_paths:
     print(f"- 📁 {p}")
 
 
@@ -67,8 +67,8 @@ def allowed_paths():
     Returns: Dict with 'allowed_paths' and 'media_indexed_paths' as lists of strings.
     """
     return {
-        "allowed_paths": [str(p) for p in config["allowed_paths"]],
-        "media_indexed_paths": [str(p) for p in config["media_index_allowed_paths"]],
+        "allowed_paths": [str(p) for p in config.allowed_paths],
+        "media_indexed_paths": [str(p) for p in config.media_index_allowed_paths],
     }
 
 
@@ -222,9 +222,9 @@ def write_file(
         # --- DB UPDATE: Re-scan the single file to add it back with the new hash ---
         file_type = helpers.get_file_type(str(file_path))
         if file_type == "image":
-            image_utils.scan_images([str(file_path)], silent=True)
+            image_utils.scan_images([str(file_path)])
         else:
-            file_utils.scan_files([str(file_path)], silent=True)
+            file_utils.scan_files([str(file_path)])
         return {"success": True}
     except Exception as e:
         return {"error": str(e)}
@@ -355,9 +355,9 @@ def copy_file(
                 # 2. Re-scan the new file to update the database
                 file_type = helpers.get_file_type(str(final_dest))
                 if file_type == "image":
-                    image_utils.scan_images([str(final_dest)], silent=True)
+                    image_utils.scan_images([str(final_dest)])
                 else:
-                    file_utils.scan_files([str(final_dest)], silent=True)
+                    file_utils.scan_files([str(final_dest)])
             except Exception as e:
                 failed.append(
                     {

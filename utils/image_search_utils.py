@@ -9,8 +9,10 @@ from tqdm import tqdm
 from transformers import AutoProcessor, AutoModel
 from transformers.utils import logging as hf_logging
 
-from utils import exif_utils, database, fileops_utils
+from utils import exif_utils, database
 from helpers.helpers import sha256_file, list_images
+from config.settings import load_config, should_exclude
+
 
 # --- Constants ---
 MODEL_NAME = "google/siglip-base-patch16-224"
@@ -62,19 +64,93 @@ def embed(paths: List[str], batch: int = 32) -> np.ndarray:
     return np.zeros((0, hidden_size))
 
 
-def scan_images(scan_paths: List[str], silent: bool = False) -> Dict:
-    found = list_images(scan_paths)
+def scan_images(
+    scan_paths: List[str], verbose: bool = False, prune: bool = False
+) -> Dict:
+    """
+    Scan images under the provided scan_paths.
+
+    - verbose: If True, shows progress bars and prints status messages.
+    - prune: If True, performs a global prune of the database, removing image records that are deleted or now excluded. Defaults to False.
+    """
+    if not scan_paths and not prune:
+        return {
+            "success": True,
+            "total_media_count": 0,
+            "new_media_count": 0,
+            "updated_media_count": 0,
+            "deleted_media_count": 0,
+            "skipped_media_count": 0,
+            "excluded_media_count": 0,
+        }
+
+    config = load_config()
+    found = list_images(scan_paths) if scan_paths else []
+
+    allowed = []
+    excluded_count = 0
+    for fp in found:
+        try:
+            if should_exclude(Path(fp), config):
+                excluded_count += 1
+                continue
+        except Exception:
+            excluded_count += 1
+            continue
+        allowed.append(fp)
+
     new_paths, new_hashes, new_metadata = [], [], []
-    updated, deletions, skipped_for_exif_error = 0, [], 0
+    updated, skipped_for_exif_error, reindexed_count = 0, 0, 0
+    pruned_deleted, pruned_excluded = 0, 0
 
     with database.db.cursor() as cur:
+        if prune:
+            if verbose:
+                print("Performing global prune of image records...")
+            cur.execute("SELECT hash, path FROM files WHERE file_type = 'image'")
+            rows_for_prune = cur.fetchall()
+
+            to_prune = []
+            for h, p in rows_for_prune:
+                abs_p = os.path.abspath(p)
+                if not os.path.exists(abs_p):
+                    to_prune.append((h, "deleted"))
+                    continue
+                try:
+                    if should_exclude(Path(abs_p), config):
+                        to_prune.append((h, "excluded"))
+                except Exception:
+                    to_prune.append((h, "excluded"))
+
+            if to_prune:
+                hashes_to_delete = list(set([h for h, _ in to_prune]))
+                with database.chroma_lock:
+                    database.chroma_coll.delete(ids=hashes_to_delete)
+
+                cur.executemany(
+                    "DELETE FROM files WHERE hash=?", [(h,) for h in hashes_to_delete]
+                )
+                pruned_deleted = sum(1 for _, reason in to_prune if reason == "deleted")
+                pruned_excluded = sum(
+                    1 for _, reason in to_prune if reason == "excluded"
+                )
+                if verbose:
+                    print(
+                        f"✓ Pruned {len(hashes_to_delete)} records (deleted: {pruned_deleted}, excluded: {pruned_excluded})"
+                    )
+
         cur.execute("SELECT hash, path, id FROM files WHERE file_type = 'image'")
         known_rows = cur.fetchall()
         known = {row[0]: (row[1], row[2]) for row in known_rows}
-        iterable = tqdm(found, desc="Scanning images", disable=silent)
+
+        iterable = tqdm(allowed, desc="Scanning images", disable=not verbose)
         for fp in iterable:
-            h = sha256_file(fp)
-            abs_fp = os.path.abspath(fp)
+            try:
+                h = sha256_file(fp)
+                abs_fp = os.path.abspath(fp)
+            except (FileNotFoundError, IsADirectoryError):
+                continue
+
             if h in known:
                 if abs_fp != known[h][0]:
                     cur.execute(
@@ -88,24 +164,24 @@ def scan_images(scan_paths: List[str], silent: bool = False) -> Dict:
                 metadata = exif_utils.get_exif_data(fp)
                 if "error" in metadata:
                     skipped_for_exif_error += 1
-                    if not silent:
-                        print(f"\nWarning: Could not read EXIF for {fp}.")
+                    if verbose:
+                        print(f"Warning: Could not read EXIF for {fp}.")
                     new_metadata.append({})
                 else:
                     new_metadata.append(metadata)
+
         if new_paths:
-            if not silent:
+            if verbose:
                 print(f"Embedding {len(new_paths)} new images...")
             vecs = embed(new_paths)
-            if vecs.shape[0] != 0:
+            if getattr(vecs, "shape", (0,))[0] != 0:
                 with database.chroma_lock:
                     database.chroma_coll.add(ids=new_hashes, embeddings=vecs)
             now = datetime.now(timezone.utc).isoformat()
             for h, p, meta in zip(new_hashes, new_paths, new_metadata):
                 size = os.path.getsize(p)
                 cur.execute(
-                    """INSERT INTO files (hash, path, file_type, file_size, added_at, updated_at)
-                    VALUES (?, ?, 'image', ?, ?, ?)""",
+                    "INSERT INTO files (hash, path, file_type, file_size, added_at, updated_at) VALUES (?, ?, 'image', ?, ?, ?)",
                     (h, os.path.abspath(p), size, now, now),
                 )
                 file_id = cur.lastrowid
@@ -142,20 +218,10 @@ def scan_images(scan_paths: List[str], silent: bool = False) -> Dict:
                         meta.get("location_postcode"),
                     ),
                 )
-            if not silent:
+            if verbose:
                 print(f"✓ Added {len(new_paths)} new images")
-        existing_files = set(map(os.path.abspath, found))
-        cur.execute("SELECT hash, path FROM files WHERE file_type = 'image'")
-        for h, p in cur.fetchall():
-            if p not in existing_files and not os.path.exists(p):
-                deletions.append(h)
-        if deletions:
-            with database.chroma_lock:
-                database.chroma_coll.delete(ids=deletions)
-            cur.executemany("DELETE FROM files WHERE hash=?", [(h,) for h in deletions])
-            if not silent:
-                print(f"✓ Removed {len(deletions)} deleted images")
-        if updated and not silent:
+
+        if updated and verbose:
             print(f"✓ Updated {updated} moved images")
 
         cur.execute("SELECT file_id FROM images")
@@ -165,28 +231,29 @@ def scan_images(scan_paths: List[str], silent: bool = False) -> Dict:
             for h, (path, file_id) in known.items()
             if file_id not in existing_image_file_ids and os.path.exists(path)
         ]
-        reindexed_count = 0
+
         if missing_file_rows:
-            missing_hashes = [r[0] for r in missing_file_rows]
-            missing_paths = [r[1] for r in missing_file_rows]
-            missing_metadata = []
-            for p in missing_paths:
+            if verbose:
+                print(f"Found {len(missing_file_rows)} images to re-index...")
+            reindex_paths = [row[1] for row in missing_file_rows]
+            reindex_hashes = [row[0] for row in missing_file_rows]
+            reindex_metadata = []
+            for p in reindex_paths:
                 metadata = exif_utils.get_exif_data(p)
                 if "error" in metadata:
                     skipped_for_exif_error += 1
-                    if not silent:
-                        print(f"\nWarning: Could not read EXIF for {p}.")
-                    missing_metadata.append({})
+                    if verbose:
+                        print(f"Warning: Could not read EXIF for {p} during re-index.")
+                    reindex_metadata.append({})
                 else:
-                    missing_metadata.append(metadata)
-            if not silent:
-                print(f"Embedding {len(missing_paths)} missing images for indexing...")
-            vecs = embed(missing_paths)
-            if vecs.shape[0] != 0:
+                    reindex_metadata.append(metadata)
+
+            vecs = embed(reindex_paths)
+            if getattr(vecs, "shape", (0,))[0] != 0:
                 with database.chroma_lock:
-                    database.chroma_coll.add(ids=missing_hashes, embeddings=vecs)
-            now = datetime.now(timezone.utc).isoformat()
-            for (_, path, file_id), meta in zip(missing_file_rows, missing_metadata):
+                    database.chroma_coll.add(ids=reindex_hashes, embeddings=vecs)
+
+            for (h, p, file_id), meta in zip(missing_file_rows, reindex_metadata):
                 cur.execute(
                     """INSERT INTO images (file_id, make, model, software,
                     width, height, orientation, datetime_original, datetime_digitized,
@@ -221,15 +288,18 @@ def scan_images(scan_paths: List[str], silent: bool = False) -> Dict:
                     ),
                 )
                 reindexed_count += 1
+            if verbose:
+                print(f"✓ Re-indexed {reindexed_count} images.")
 
+    pruned_total = pruned_deleted + pruned_excluded
     return {
         "success": True,
         "total_media_count": len(found),
-        "new_media_count": len(new_paths),
+        "new_media_count": len(new_paths) + reindexed_count,
         "updated_media_count": updated,
-        "deleted_media_count": len(deletions),
+        "deleted_media_count": pruned_total,
         "skipped_media_count": skipped_for_exif_error,
-        "reindexed_images_count": reindexed_count,
+        "excluded_media_count": excluded_count,
     }
 
 
@@ -384,7 +454,7 @@ if __name__ == "__main__":
     ap.add_argument("--query-city", help="Query by city")
     args = ap.parse_args()
     if args.scan:
-        scan_images(args.scan)
+        scan_images(args.scan, prune=True, verbose=True)
     if args.text:
         print("\n🔍 Text search results:")
         pprint.pp(search_by_text(args.text))

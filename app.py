@@ -132,8 +132,6 @@ with st.sidebar:
         )
 
         if save_media_button or scan_button:
-            # --- MODIFIED: Update the 'user_' attribute when saving ---
-            # This saves only the paths visible in the UI to the config file.
             config.user_media_index_allowed_paths = [
                 Path(p) for p in st.session_state.temp_media_paths
             ]
@@ -171,6 +169,7 @@ with st.sidebar:
                         f"- New: `{result.get('new_media_count', 0)}`\n"
                         f"- Updated: `{result.get('updated_media_count', 0)}`\n"
                         f"- Deleted: `{result.get('deleted_media_count', 0)}`"
+                        f"- Excluded: `{result.get('excluded_media_count', 0)}`"
                     )
                     st.session_state.media_feedback = {
                         "status": "success",
@@ -281,6 +280,7 @@ with st.sidebar:
                             f"- New: `{result.get('new', 0)}`\n"
                             f"- Updated: `{result.get('updated', 0)}`\n"
                             f"- Deleted: `{result.get('deleted', 0)}`"
+                            f"- Excluded: `{result.get('excluded', 0)}`"
                         )
                         st.session_state.allowed_feedback = {
                             "status": "success",
@@ -303,9 +303,6 @@ with st.sidebar:
         )
 
     st.markdown("---")
-
-    # ... (The rest of your code for exclusions and the chat interface remains unchanged)
-    # ... (I've omitted it for brevity, but it should be included in your final file)
 
     with st.form(key="exclusion_patterns_form"):
         st.subheader("🚫 Exclusion Patterns")
@@ -416,7 +413,14 @@ for message in st.session_state.messages:
 
 
 if prompt := st.chat_input("Ask me anything..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": prompt,
+            "timestamp": datetime.datetime.now().strftime("%B %d, %Y %H:%M:%S"),
+            "file_path": None,
+        }
+    )
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -430,18 +434,14 @@ if prompt := st.chat_input("Ask me anything..."):
                 state = {"thoughts": "", "final_answer": ""}
 
                 async def stream_agent_response(state_dict):
-                    current_datetime = datetime.datetime.now().strftime(
-                        "%B %d, %Y %H:%M:%S"
-                    )
+                    def get_msg(m):
+                        if m["role"] != "user":
+                            return m["content"]
+                        return f"Message details:\n- Sent at: {m['timestamp']}\n- Uploaded file: {m['file_path']}\n---\n Message content:\n{m['content']}"
+
                     inputs = {
                         "messages": [
-                            (
-                                "system",
-                                f"The current date and time is {current_datetime}.",
-                            ),
-                        ]
-                        + [
-                            (msg["role"], msg["content"])
+                            (msg["role"], get_msg(msg))
                             for msg in st.session_state.messages
                         ]
                     }

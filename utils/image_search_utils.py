@@ -10,7 +10,7 @@ from transformers import AutoProcessor, AutoModel
 from transformers.utils import logging as hf_logging
 
 from utils import exif_utils, database
-from helpers.helpers import sha256_file, list_images
+from helpers.helpers import sha256_file, list_images, get_file_type
 from config.settings import load_config, should_exclude
 
 
@@ -68,12 +68,22 @@ def scan_images(
     scan_paths: List[str], verbose: bool = False, prune: bool = False
 ) -> Dict:
     """
-    Scan images under the provided scan_paths.
+    Scan images under the provided scan_paths, updating the database with metadata and embeddings.
 
-    - verbose: If True, shows progress bars and prints status messages.
-    - prune: If True, performs a global prune of the database, removing image records that are deleted or now excluded. Defaults to False.
+    Args:
+        scan_paths: List of file or directory paths to scan for images.
+        verbose: If True, shows progress bars and prints status messages.
+        prune: If True, performs a global prune of the database, removing image records that are deleted or now excluded.
+
+    Returns:
+        Dict with scan results: success, counts for total, new, updated, deleted, skipped, and excluded images.
     """
-    if not scan_paths and not prune:
+    if scan_paths is None:
+        scan_paths = []
+    scan_paths_abs = [os.path.abspath(p) for p in scan_paths]
+    config = load_config()
+
+    if not scan_paths_abs and not prune:
         return {
             "success": True,
             "total_media_count": 0,
@@ -84,34 +94,46 @@ def scan_images(
             "excluded_media_count": 0,
         }
 
-    config = load_config()
-    found = list_images(scan_paths) if scan_paths else []
+    all_images = list_images(scan_paths_abs) if scan_paths_abs else []
+    found_paths_on_disk = {os.path.abspath(fp) for fp in all_images}
 
-    allowed = []
+    allowed_images = []
     excluded_count = 0
-    for fp in found:
+    for fp in all_images:
+        abs_fp = os.path.abspath(fp)
         try:
-            if should_exclude(Path(fp), config):
+            if should_exclude(Path(abs_fp), config):
                 excluded_count += 1
                 continue
-        except Exception:
+        except Exception as e:
+            if verbose:
+                print(f"⚠️ Skipped image {fp}: Exclusion check failed - {str(e)}")
             excluded_count += 1
             continue
-        allowed.append(fp)
+        allowed_images.append(fp)
 
     new_paths, new_hashes, new_metadata = [], [], []
-    updated, skipped_for_exif_error, reindexed_count = 0, 0, 0
-    pruned_deleted, pruned_excluded = 0, 0
+    updated = 0
+    skipped_for_error = 0
+    reindexed_count = 0
+    pruned_deleted = 0
+    pruned_excluded = 0
+
+    now = datetime.now(timezone.utc).isoformat()
 
     with database.db.cursor() as cur:
-        if prune:
-            if verbose:
-                print("Performing global prune of image records...")
-            cur.execute("SELECT hash, path FROM files WHERE file_type = 'image'")
-            rows_for_prune = cur.fetchall()
+        # Fetch all image records once
+        cur.execute("SELECT hash, path, id FROM files WHERE file_type = 'image'")
+        db_records = cur.fetchall()
+        known_hashes = {rec[0]: (rec[1], rec[2]) for rec in db_records}
+        known_paths = {rec[1]: (rec[0], rec[2]) for rec in db_records}
+        db_paths = set(known_paths.keys())
 
-            to_prune = []
-            for h, p in rows_for_prune:
+        # Pruning: global deletions + local/global exclusions
+        to_prune: List[tuple[str, str]] = []
+        if prune:
+            # Global prune: check all DB records
+            for h, (p, file_id) in known_hashes.items():
                 abs_p = os.path.abspath(p)
                 if not os.path.exists(abs_p):
                     to_prune.append((h, "deleted"))
@@ -121,12 +143,34 @@ def scan_images(
                         to_prune.append((h, "excluded"))
                 except Exception:
                     to_prune.append((h, "excluded"))
+        else:
+            # Global deletions (like scan_files)
+            candidates_deleted = db_paths - found_paths_on_disk
+            for path in candidates_deleted:
+                if not os.path.exists(path):
+                    h = known_paths[path][0]
+                    to_prune.append((h, "deleted"))
 
-            if to_prune:
-                hashes_to_delete = list(set([h for h, _ in to_prune]))
-                with database.chroma_lock:
+            # Local exclusions: only on paths found in scan
+            local_paths_to_check = db_paths & found_paths_on_disk
+            for path in local_paths_to_check:
+                try:
+                    if should_exclude(Path(path), config):
+                        h = known_paths[path][0]
+                        to_prune.append((h, "excluded"))
+                except Exception:
+                    h = known_paths[path][0]
+                    to_prune.append((h, "excluded"))
+
+        if to_prune:
+            hashes_to_delete = list(set(h for h, _ in to_prune))
+            with database.chroma_lock:
+                try:
                     database.chroma_coll.delete(ids=hashes_to_delete)
-
+                except Exception as e:
+                    if verbose:
+                        print(f"⚠️ Warning: Failed to delete vectors from Chroma: {e}")
+            try:
                 cur.executemany(
                     "DELETE FROM files WHERE hash=?", [(h,) for h in hashes_to_delete]
                 )
@@ -138,168 +182,319 @@ def scan_images(
                     print(
                         f"✓ Pruned {len(hashes_to_delete)} records (deleted: {pruned_deleted}, excluded: {pruned_excluded})"
                     )
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Error during pruning: {e}")
+                return {"success": False, "error": f"Pruning failed: {str(e)}"}
 
-        cur.execute("SELECT hash, path, id FROM files WHERE file_type = 'image'")
-        known_rows = cur.fetchall()
-        known = {row[0]: (row[1], row[2]) for row in known_rows}
+        # Update in-memory known maps
+        for h, _ in to_prune:
+            p, _ = known_hashes.pop(h, (None, None))
+            if p:
+                known_paths.pop(p, None)
 
-        iterable = tqdm(allowed, desc="Scanning images", disable=not verbose)
+        # Scan allowed images
+        iterable = tqdm(allowed_images, desc="Scanning images", disable=not verbose)
         for fp in iterable:
             try:
-                h = sha256_file(fp)
                 abs_fp = os.path.abspath(fp)
-            except (FileNotFoundError, IsADirectoryError):
+                h = sha256_file(fp)
+                file_size = os.path.getsize(fp)
+            except (
+                FileNotFoundError,
+                IsADirectoryError,
+                PermissionError,
+                OSError,
+            ) as e:
+                if verbose:
+                    print(f"⚠️ Skipped image {fp}: {str(e)}")
+                skipped_for_error += 1
                 continue
 
-            if h in known:
-                if abs_fp != known[h][0]:
-                    cur.execute(
-                        "UPDATE files SET path=?, updated_at=? WHERE hash=?",
-                        (abs_fp, datetime.now(timezone.utc).isoformat(), h),
-                    )
-                    updated += 1
-            else:
-                new_paths.append(fp)
-                new_hashes.append(h)
+            try:
                 metadata = exif_utils.get_exif_data(fp)
                 if "error" in metadata:
-                    skipped_for_exif_error += 1
                     if verbose:
-                        print(f"Warning: Could not read EXIF for {fp}.")
-                    new_metadata.append({})
-                else:
-                    new_metadata.append(metadata)
+                        print(f"⚠️ Skipped image {fp}: EXIF read error")
+                    skipped_for_error += 1
+                    metadata = {}  # Proceed with empty metadata
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Skipped image {fp}: EXIF processing error - {str(e)}")
+                skipped_for_error += 1
+                metadata = {}
+                continue
 
+            if abs_fp in known_paths:
+                # Case 1: Path known, check if modified
+                known_hash, file_id = known_paths[abs_fp]
+                if h != known_hash:
+                    try:
+                        cur.execute(
+                            "UPDATE files SET hash=?, file_size=?, updated_at=? WHERE path=?",
+                            (h, file_size, now, abs_fp),
+                        )
+                        # Update images table with new metadata
+                        cur.execute("DELETE FROM images WHERE file_id=?", (file_id,))
+                        cur.execute(
+                            """INSERT INTO images (file_id, make, model, software,
+                            width, height, orientation, datetime_original, datetime_digitized,
+                            exposure_time, f_number, iso, focal_length, flash,
+                            latitude, longitude, altitude, gps_timestamp,
+                            location_display_name, location_country, location_state, location_city, location_postcode)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                file_id,
+                                metadata.get("make"),
+                                metadata.get("model"),
+                                metadata.get("software"),
+                                metadata.get("width"),
+                                metadata.get("height"),
+                                metadata.get("orientation"),
+                                metadata.get("datetime_original"),
+                                metadata.get("datetime_digitized"),
+                                metadata.get("exposure_time"),
+                                metadata.get("f_number"),
+                                metadata.get("iso"),
+                                metadata.get("focal_length"),
+                                metadata.get("flash"),
+                                metadata.get("latitude"),
+                                metadata.get("longitude"),
+                                metadata.get("altitude"),
+                                metadata.get("gps_timestamp"),
+                                metadata.get("location_display_name"),
+                                metadata.get("location_country"),
+                                metadata.get("location_state"),
+                                metadata.get("location_city"),
+                                metadata.get("location_postcode"),
+                            ),
+                        )
+                        updated += 1
+                    except Exception as e:
+                        if verbose:
+                            print(f"⚠️ Failed to update image {fp}: {str(e)}")
+                        skipped_for_error += 1
+                        continue
+            elif h in known_hashes:
+                # Case 2: Hash known, file moved
+                try:
+                    cur.execute(
+                        "UPDATE files SET path=?, updated_at=? WHERE hash=?",
+                        (abs_fp, now, h),
+                    )
+                    updated += 1
+                except Exception as e:
+                    if verbose:
+                        print(f"⚠️ Failed to update moved image {fp}: {str(e)}")
+                    skipped_for_error += 1
+                    continue
+            else:
+                # Case 3: New image
+                new_paths.append(fp)
+                new_hashes.append(h)
+                new_metadata.append(metadata)
+
+        # Bulk insert new images
         if new_paths:
-            if verbose:
-                print(f"Embedding {len(new_paths)} new images...")
-            vecs = embed(new_paths)
-            if getattr(vecs, "shape", (0,))[0] != 0:
-                with database.chroma_lock:
-                    database.chroma_coll.add(ids=new_hashes, embeddings=vecs)
-            now = datetime.now(timezone.utc).isoformat()
-            for h, p, meta in zip(new_hashes, new_paths, new_metadata):
-                size = os.path.getsize(p)
-                cur.execute(
-                    "INSERT INTO files (hash, path, file_type, file_size, added_at, updated_at) VALUES (?, ?, 'image', ?, ?, ?)",
-                    (h, os.path.abspath(p), size, now, now),
-                )
-                file_id = cur.lastrowid
-                cur.execute(
-                    """INSERT INTO images (file_id, make, model, software,
-                    width, height, orientation, datetime_original, datetime_digitized,
-                    exposure_time, f_number, iso, focal_length, flash,
-                    latitude, longitude, altitude, gps_timestamp,
-                    location_display_name, location_country, location_state, location_city, location_postcode)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        file_id,
-                        meta.get("make"),
-                        meta.get("model"),
-                        meta.get("software"),
-                        meta.get("width"),
-                        meta.get("height"),
-                        meta.get("orientation"),
-                        meta.get("datetime_original"),
-                        meta.get("datetime_digitized"),
-                        meta.get("exposure_time"),
-                        meta.get("f_number"),
-                        meta.get("iso"),
-                        meta.get("focal_length"),
-                        meta.get("flash"),
-                        meta.get("latitude"),
-                        meta.get("longitude"),
-                        meta.get("altitude"),
-                        meta.get("gps_timestamp"),
-                        meta.get("location_display_name"),
-                        meta.get("location_country"),
-                        meta.get("location_state"),
-                        meta.get("location_city"),
-                        meta.get("location_postcode"),
-                    ),
-                )
-            if verbose:
-                print(f"✓ Added {len(new_paths)} new images")
+            try:
+                if verbose:
+                    print(f"Embedding {len(new_paths)} new images...")
+                vecs = embed(new_paths)
+                if getattr(vecs, "shape", (0,))[0] != len(new_paths):
+                    if verbose:
+                        print(f"⚠️ Embedding failed for some or all new images")
+                    skipped_for_error += len(new_paths)
+                else:
+                    with database.chroma_lock:
+                        try:
+                            database.chroma_coll.add(ids=new_hashes, embeddings=vecs)
+                        except Exception as e:
+                            if verbose:
+                                print(f"⚠️ Failed to add embeddings to Chroma: {e}")
+                            skipped_for_error += len(new_paths)
+                            new_paths.clear()
+                            new_hashes.clear()
+                            new_metadata.clear()
+                    for h, p, meta in zip(new_hashes, new_paths, new_metadata):
+                        try:
+                            size = os.path.getsize(p)
+                            cur.execute(
+                                "INSERT INTO files (hash, path, file_type, file_size, added_at, updated_at) VALUES (?, ?, 'image', ?, ?, ?)",
+                                (h, os.path.abspath(p), size, now, now),
+                            )
+                            file_id = cur.lastrowid
+                            cur.execute(
+                                """INSERT INTO images (file_id, make, model, software,
+                                width, height, orientation, datetime_original, datetime_digitized,
+                                exposure_time, f_number, iso, focal_length, flash,
+                                latitude, longitude, altitude, gps_timestamp,
+                                location_display_name, location_country, location_state, location_city, location_postcode)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    file_id,
+                                    meta.get("make"),
+                                    meta.get("model"),
+                                    meta.get("software"),
+                                    meta.get("width"),
+                                    meta.get("height"),
+                                    meta.get("orientation"),
+                                    meta.get("datetime_original"),
+                                    meta.get("datetime_digitized"),
+                                    meta.get("exposure_time"),
+                                    meta.get("f_number"),
+                                    meta.get("iso"),
+                                    meta.get("focal_length"),
+                                    meta.get("flash"),
+                                    meta.get("latitude"),
+                                    meta.get("longitude"),
+                                    meta.get("altitude"),
+                                    meta.get("gps_timestamp"),
+                                    meta.get("location_display_name"),
+                                    meta.get("location_country"),
+                                    meta.get("location_state"),
+                                    meta.get("location_city"),
+                                    meta.get("location_postcode"),
+                                ),
+                            )
+                        except Exception as e:
+                            if verbose:
+                                print(f"⚠️ Failed to insert image {p}: {str(e)}")
+                            skipped_for_error += 1
+                            continue
+                    if verbose:
+                        print(f"✓ Added {len(new_paths)} new images")
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Error embedding new images: {e}")
+                skipped_for_error += len(new_paths)
+                new_paths.clear()
+                new_hashes.clear()
+                new_metadata.clear()
 
         if updated and verbose:
-            print(f"✓ Updated {updated} moved images")
+            print(f"✓ Updated {updated} moved or modified images")
 
+        # Reindex images missing from images table
         cur.execute("SELECT file_id FROM images")
         existing_image_file_ids = set(r[0] for r in cur.fetchall())
         missing_file_rows = [
             (h, os.path.abspath(path), file_id)
-            for h, (path, file_id) in known.items()
+            for h, (path, file_id) in known_hashes.items()
             if file_id not in existing_image_file_ids and os.path.exists(path)
         ]
 
         if missing_file_rows:
-            if verbose:
-                print(f"Found {len(missing_file_rows)} images to re-index...")
-            reindex_paths = [row[1] for row in missing_file_rows]
-            reindex_hashes = [row[0] for row in missing_file_rows]
-            reindex_metadata = []
-            for p in reindex_paths:
-                metadata = exif_utils.get_exif_data(p)
-                if "error" in metadata:
-                    skipped_for_exif_error += 1
-                    if verbose:
-                        print(f"Warning: Could not read EXIF for {p} during re-index.")
-                    reindex_metadata.append({})
-                else:
-                    reindex_metadata.append(metadata)
+            try:
+                if verbose:
+                    print(f"Found {len(missing_file_rows)} images to re-index...")
+                reindex_paths = []
+                reindex_hashes = []
+                reindex_file_ids = []
+                reindex_metadata = []
+                for h, p, file_id in missing_file_rows:
+                    # Verify still an image
+                    if get_file_type(p) != "image":
+                        if verbose:
+                            print(f"⚠️ Skipped reindexing {p}: Not an image")
+                        continue
+                    try:
+                        metadata = exif_utils.get_exif_data(p)
+                        if "error" in metadata:
+                            if verbose:
+                                print(f"⚠️ Skipped reindexing {p}: EXIF read error")
+                            skipped_for_error += 1
+                            metadata = {}
+                        reindex_paths.append(p)
+                        reindex_hashes.append(h)
+                        reindex_file_ids.append(file_id)
+                        reindex_metadata.append(metadata)
+                    except Exception as e:
+                        if verbose:
+                            print(f"⚠️ Skipped reindexing {p}: EXIF error - {str(e)}")
+                        skipped_for_error += 1
+                        continue
 
-            vecs = embed(reindex_paths)
-            if getattr(vecs, "shape", (0,))[0] != 0:
-                with database.chroma_lock:
-                    database.chroma_coll.add(ids=reindex_hashes, embeddings=vecs)
+                if reindex_paths:
+                    vecs = embed(reindex_paths)
+                    if getattr(vecs, "shape", (0,))[0] != len(reindex_paths):
+                        if verbose:
+                            print(f"⚠️ Embedding failed for some re-indexed images")
+                        skipped_for_error += len(reindex_paths)
+                    else:
+                        with database.chroma_lock:
+                            try:
+                                database.chroma_coll.add(
+                                    ids=reindex_hashes, embeddings=vecs
+                                )
+                            except Exception as e:
+                                if verbose:
+                                    print(f"⚠️ Failed to add reindex embeddings: {e}")
+                                skipped_for_error += len(reindex_paths)
+                                reindex_paths.clear()
+                                reindex_hashes.clear()
+                                reindex_file_ids.clear()
+                                reindex_metadata.clear()
+                        for p, h, file_id, meta in zip(
+                            reindex_paths,
+                            reindex_hashes,
+                            reindex_file_ids,
+                            reindex_metadata,
+                        ):
+                            try:
+                                cur.execute(
+                                    """INSERT INTO images (file_id, make, model, software,
+                                    width, height, orientation, datetime_original, datetime_digitized,
+                                    exposure_time, f_number, iso, focal_length, flash,
+                                    latitude, longitude, altitude, gps_timestamp,
+                                    location_display_name, location_country, location_state, location_city, location_postcode)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    (
+                                        file_id,
+                                        meta.get("make"),
+                                        meta.get("model"),
+                                        meta.get("software"),
+                                        meta.get("width"),
+                                        meta.get("height"),
+                                        meta.get("orientation"),
+                                        meta.get("datetime_original"),
+                                        meta.get("datetime_digitized"),
+                                        meta.get("exposure_time"),
+                                        meta.get("f_number"),
+                                        meta.get("iso"),
+                                        meta.get("focal_length"),
+                                        meta.get("flash"),
+                                        meta.get("latitude"),
+                                        meta.get("longitude"),
+                                        meta.get("altitude"),
+                                        meta.get("gps_timestamp"),
+                                        meta.get("location_display_name"),
+                                        meta.get("location_country"),
+                                        meta.get("location_state"),
+                                        meta.get("location_city"),
+                                        meta.get("location_postcode"),
+                                    ),
+                                )
+                                reindexed_count += 1
+                            except Exception as e:
+                                if verbose:
+                                    print(f"⚠️ Failed to reindex image {p}: {str(e)}")
+                                skipped_for_error += 1
+                                continue
+                        if verbose:
+                            print(f"✓ Re-indexed {reindexed_count} images")
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Error during reindexing: {e}")
+                skipped_for_error += len(missing_file_rows)
 
-            for (h, p, file_id), meta in zip(missing_file_rows, reindex_metadata):
-                cur.execute(
-                    """INSERT INTO images (file_id, make, model, software,
-                    width, height, orientation, datetime_original, datetime_digitized,
-                    exposure_time, f_number, iso, focal_length, flash,
-                    latitude, longitude, altitude, gps_timestamp,
-                    location_display_name, location_country, location_state, location_city, location_postcode)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        file_id,
-                        meta.get("make"),
-                        meta.get("model"),
-                        meta.get("software"),
-                        meta.get("width"),
-                        meta.get("height"),
-                        meta.get("orientation"),
-                        meta.get("datetime_original"),
-                        meta.get("datetime_digitized"),
-                        meta.get("exposure_time"),
-                        meta.get("f_number"),
-                        meta.get("iso"),
-                        meta.get("focal_length"),
-                        meta.get("flash"),
-                        meta.get("latitude"),
-                        meta.get("longitude"),
-                        meta.get("altitude"),
-                        meta.get("gps_timestamp"),
-                        meta.get("location_display_name"),
-                        meta.get("location_country"),
-                        meta.get("location_state"),
-                        meta.get("location_city"),
-                        meta.get("location_postcode"),
-                    ),
-                )
-                reindexed_count += 1
-            if verbose:
-                print(f"✓ Re-indexed {reindexed_count} images.")
-
-    pruned_total = pruned_deleted + pruned_excluded
     return {
         "success": True,
-        "total_media_count": len(found),
-        "new_media_count": len(new_paths) + reindexed_count,
+        "total_media_count": len(all_images),
+        "new_media_count": len(new_paths),
         "updated_media_count": updated,
-        "deleted_media_count": pruned_total,
-        "skipped_media_count": skipped_for_exif_error,
-        "excluded_media_count": excluded_count,
+        "deleted_media_count": pruned_deleted,
+        "skipped_media_count": skipped_for_error,
+        "excluded_media_count": excluded_count + pruned_excluded,
     }
 
 

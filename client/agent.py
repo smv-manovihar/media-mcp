@@ -61,7 +61,7 @@ def init_agent():
 
         # Create the ReAct agent
         agent_executor = create_react_agent(
-            model=model.bind_tools(tools),
+            model=model,
             tools=tools,
             prompt=prompt_template,
         )

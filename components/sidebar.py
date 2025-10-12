@@ -137,7 +137,7 @@ def manage_sidebar():
                             f"- Total: `{result.get('total_media_count', 0)}`\n"
                             f"- New: `{result.get('new_media_count', 0)}`\n"
                             f"- Updated: `{result.get('updated_media_count', 0)}`\n"
-                            f"- Deleted: `{result.get('deleted_media_count', 0)}`"
+                            f"- Deleted: `{result.get('deleted_media_count', 0)}\n`"
                             f"- Excluded: `{result.get('excluded_media_count', 0)}`"
                         )
                         st.session_state.media_feedback = {
@@ -252,7 +252,7 @@ def manage_sidebar():
                                 f"- Found: `{result.get('found', 0)}`\n"
                                 f"- New: `{result.get('new', 0)}`\n"
                                 f"- Updated: `{result.get('updated', 0)}`\n"
-                                f"- Deleted: `{result.get('deleted', 0)}`"
+                                f"- Deleted: `{result.get('deleted', 0)}`\n"
                                 f"- Excluded: `{result.get('excluded', 0)}`"
                             )
                         st.session_state.allowed_feedback = {

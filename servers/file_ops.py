@@ -145,14 +145,18 @@ def create_directory(path: Union[str, List[str]], full_path: bool = False):
 
 @mcp.tool("read_file")
 def read_file(
-    path: Union[str, List[str]], full_path: bool = False, max_chars: int = 1000
-):
+    path: Union[str, List[str]],
+    full_path: bool = False,
+    skip_chars: int = 0,
+    max_chars: int = 500,
+) -> Dict[str, List[Dict[str, str]]]:
     """
     Reads text file(s) contents, truncated to max_chars. Supports batch via list.
     Args:
     - path (str|List[str], required): File path(s).
     - full_path (bool, optional): Return absolute paths (default: False).
-    - max_chars (int, optional): Max chars per file (default: 1000).
+    - skip_chars (int, optional): Skip first n chars (default: 0).
+    - max_chars (int, optional): Max chars per file (default: 500).
     Returns: Dict with 'results' list of dicts {'path': str, 'content': str} or {'error': str}.
     """
     try:
@@ -160,16 +164,23 @@ def read_file(
         results = []
         for file_path in file_paths:
             if not file_path.is_file():
-                results.append({"error": f"{file_path} is not a valid file"})
+                results.append({"error": f"'{file_path.name}' is not a valid file"})
                 continue
             try:
                 with file_path.open("r", encoding="utf-8") as f:
-                    content = f.read()
-                    if len(content) > max_chars:
-                        content = (
-                            content[:max_chars]
-                            + f"\n\n[Content truncated to {max_chars} characters for context limit]"
-                        )
+                    # Move the file pointer to the starting position
+                    if skip_chars > 0:
+                        f.seek(skip_chars)
+
+                    # Read the specified number of characters
+                    content = f.read(max_chars)
+
+                    # Check if there's more content to indicate truncation
+                    is_truncated = f.read(1) != ""
+
+                    if is_truncated:
+                        content += f"\n\n[Content truncated to {max_chars} characters for context limit]"
+
                     results.append(
                         {
                             "path": str(file_path if full_path else file_path.name),

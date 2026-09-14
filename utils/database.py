@@ -12,9 +12,9 @@ DB_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- ChromaDB Setup ---
 chroma_client = chromadb.PersistentClient(path=str(CHROMADB_PATH))
-# This collection will only store embeddings for images
+# This collection will only store embeddings for images with cosine distance
 chroma_coll = chroma_client.get_or_create_collection(
-    name="siglip_images", embedding_function=None
+    name="siglip_images", embedding_function=None, metadata={"hnsw:space": "cosine"}
 )
 chroma_lock = threading.Lock()
 
@@ -114,6 +114,35 @@ def _initialize_schema():
             )"""
         )
 
+        # --- Table 3: Chat Sessions ---
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                is_pinned INTEGER DEFAULT 0
+            )"""
+        )
+
+        # --- Table 4: Chat Messages ---
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                reasoning TEXT,
+                tool_calls TEXT, -- JSON string
+                file_path TEXT, -- file path or JSON list
+                timestamp TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+            )"""
+        )
+
         # --- Indexes for new 'files' table ---
         cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_path ON files(path)"
@@ -123,8 +152,7 @@ def _initialize_schema():
         )  # Index hash for lookups
         cur.execute("CREATE INDEX IF NOT EXISTS idx_file_type ON files(file_type)")
 
-        # --- Indexes for new 'images' table ---
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_path ON images(path)")
+        # --- Indexes for 'images' table ---
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_meta_make_model ON images(make, model)"
         )
@@ -138,6 +166,15 @@ def _initialize_schema():
             "CREATE INDEX IF NOT EXISTS idx_meta_country_city ON images(location_country, location_city)"
         )
 
+        # --- Indexes for Chat tables ---
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, created_at)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at DESC)"
+        )
+
 
 # Run schema setup when the module is imported
 _initialize_schema()
+

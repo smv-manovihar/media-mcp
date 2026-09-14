@@ -209,6 +209,28 @@ def get_exif_data(image_path: Path) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+def get_camera_metadata(exif: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract camera/shooting metadata from an already-parsed EXIF dict
+    (i.e. the dict returned by get_exif_data).
+    """
+    return {
+        "make": exif.get("make"),
+        "model": exif.get("model"),
+        "software": exif.get("software"),
+        "width": exif.get("width"),
+        "height": exif.get("height"),
+        "orientation": exif.get("orientation"),
+        "datetime_original": exif.get("datetime_original"),
+        "datetime_digitized": exif.get("datetime_digitized"),
+        "exposure_time": exif.get("exposure_time"),
+        "f_number": exif.get("f_number"),
+        "iso": exif.get("iso"),
+        "focal_length": exif.get("focal_length"),
+        "flash": exif.get("flash"),
+    }
+
+
 if __name__ == "__main__":
     # Example usage
     img_path = Path(r"D:\Coding\MediaMCP\media\20231224173151_IMG_7683.JPG")

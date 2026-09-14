@@ -34,15 +34,23 @@ def sha256_file(fp: str, chunk: int = 1 << 20) -> Optional[str]:
         raise  # Re-raise specific exceptions for caller to handle
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
+
+
 def list_images(paths: List[str]) -> List[str]:
     images = []
     for p in paths:
-        if os.path.isdir(p):
-            for ext in ("*.jpg", "*.jpeg", "*.png"):
-                images += glob.glob(os.path.join(p, "**", ext), recursive=True)
-        elif os.path.isfile(p) and p.lower().endswith((".jpg", ".jpeg", ".png")):
-            images.append(p)
-    return images
+        path_obj = Path(p)
+        if path_obj.is_dir():
+            try:
+                for f in path_obj.rglob("*"):
+                    if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS:
+                        images.append(str(f.resolve()))
+            except (PermissionError, OSError):
+                pass
+        elif path_obj.is_file() and path_obj.suffix.lower() in IMAGE_EXTENSIONS:
+            images.append(str(path_obj.resolve()))
+    return sorted(list(set(images)))
 
 
 def get_file_type(file_path: str) -> str:

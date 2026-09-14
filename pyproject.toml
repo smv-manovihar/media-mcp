@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=1.5.0",
     "beautifulsoup4>=4.13.5",
     "chromadb>=1.1.0",
     "ddgs>=9.5.5",
@@ -12,10 +13,13 @@ dependencies = [
     "fastmcp>=2.12.5",
     "huggingface-hub[cli]>=0.35.0",
     "imagehash>=4.3.2",
-    "langchain>=0.3.27",
+    "langchain>=1.0.2",
+    "langchain-anthropic>=1.7.2",
     "langchain-groq>=0.3.8",
     "langchain-mcp-adapters>=0.1.9",
-    "langgraph>=0.6.7",
+    "langchain-openai>=1.6.2",
+    "openai>=3.13.0",
+    "langgraph>=1.0.1",
     "mcp>=1.14.0",
     "nltk>=3.9.1",
     "numpy>=2.3.3",
@@ -24,7 +28,13 @@ dependencies = [
     "sentencepiece>=0.2.1",
     "streamlit>=1.49.1",
     "torch>=2.8.0",
+    "torchvision",
     "transformers>=4.56.1",
     "uvicorn>=0.38.0",
     "websockets>=15.0.1",
+    "langgraph-checkpoint>=4.2.0",
+    "pypdf>=6.18.1",
+    "python-docx>=1.2.0",
+    "openpyxl>=3.1.5",
+    "langchain-google-genai>=4.4.0",
 ]

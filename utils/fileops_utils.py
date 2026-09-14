@@ -1,7 +1,7 @@
 import os
 from tqdm import tqdm
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Any
 from pathlib import Path
 
 # Assume these helpers and utils are available from your project
@@ -11,7 +11,11 @@ from config.settings import load_config, should_exclude
 
 
 def scan_files(
-    scan_paths: List[str], verbose: bool = False, prune: bool = False
+    scan_paths: List[str],
+    verbose: bool = False,
+    prune: bool = False,
+    progress_callback: Any = None,
+    cancel_event: Any = None,
 ) -> Dict:
     """
     Scans the provided paths, updating the database.
@@ -59,6 +63,11 @@ def scan_files(
     pruned_excluded = 0
 
     now = datetime.now(timezone.utc).isoformat()
+
+    if progress_callback:
+        progress_callback(0, len(allowed_files) if allowed_files else 1, "Checking file records to prune...")
+    if cancel_event and cancel_event.is_set():
+        return {"cancelled": True, "scan_type": "all_files"}
 
     with database.db.cursor() as cur:
         cur.execute("SELECT hash, path FROM files")
@@ -127,8 +136,19 @@ def scan_files(
                 known_paths.pop(p, None)
 
         # Scan and process allowed files
+        total_allowed = len(allowed_files)
         iterable = tqdm(allowed_files, desc="Scanning files", disable=not verbose)
-        for fp in iterable:
+        for idx, fp in enumerate(iterable, 1):
+            if cancel_event and cancel_event.is_set():
+                if verbose:
+                    print("File scan cancelled by user.")
+                break
+            if progress_callback and (idx % 5 == 0 or idx == total_allowed):
+                progress_callback(
+                    idx,
+                    total_allowed,
+                    f"Scanning file: {Path(fp).name} ({idx}/{total_allowed})",
+                )
             try:
                 abs_fp = os.path.abspath(fp)
                 h = sha256_file(fp)

@@ -2,7 +2,7 @@ import os, torch, warnings
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Any
 
 from PIL import Image
 from tqdm import tqdm
@@ -28,20 +28,61 @@ hf_logging.set_verbosity_error()
 warnings.filterwarnings("ignore", message=".*slow image processor.*")
 
 
+import threading
+
+_model_lock = threading.Lock()
+_processor = None
+_model = None
+
+
 def load_model():
     """Load model into project-local cache dir"""
-    processor = AutoProcessor.from_pretrained(
+    proc = AutoProcessor.from_pretrained(
         MODEL_NAME, cache_dir=str(MODEL_CACHE_DIR)
     )
-    model = (
+    mod = (
         AutoModel.from_pretrained(MODEL_NAME, cache_dir=str(MODEL_CACHE_DIR))
         .to(DEVICE)
         .eval()
     )
-    return processor, model
+    return proc, mod
 
 
-processor, model = load_model()
+def get_model_and_processor():
+    """Lazily load SigLIP model and processor in a thread-safe manner."""
+    global _processor, _model
+    if _processor is None or _model is None:
+        with _model_lock:
+            if _processor is None or _model is None:
+                _processor, _model = load_model()
+    return _processor, _model
+
+
+def __getattr__(name):
+    if name in ("processor", "model"):
+        p, m = get_model_and_processor()
+        return p if name == "processor" else m
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+def _extract_tensor(output: Any) -> torch.Tensor:
+    """Safely extracts raw feature tensor whether transformers returns a Tensor or BaseModelOutputWithPooling."""
+    if isinstance(output, torch.Tensor):
+        return output
+    if hasattr(output, "pooler_output") and output.pooler_output is not None:
+        return output.pooler_output
+    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        return output.last_hidden_state[:, 0]
+    if isinstance(output, dict):
+        if output.get("pooler_output") is not None:
+            return output["pooler_output"]
+        if output.get("last_hidden_state") is not None:
+            return output["last_hidden_state"][:, 0]
+    if isinstance(output, (tuple, list)) and len(output) > 1 and isinstance(output[1], torch.Tensor):
+        return output[1]
+    if isinstance(output, (tuple, list)) and len(output) > 0 and isinstance(output[0], torch.Tensor):
+        return output[0]
+    return output
 
 
 def embed(paths: List[str], batch: int = 32) -> np.ndarray:
@@ -55,9 +96,15 @@ def embed(paths: List[str], batch: int = 32) -> np.ndarray:
                 img = img.convert("RGBA")
             img = img.convert("RGB")
             imgs.append(img)
-        inputs = processor(images=imgs, return_tensors="pt").to(DEVICE)
+        proc, mod = get_model_and_processor()
+        inputs = proc(images=imgs, return_tensors="pt").to(DEVICE)
         with torch.no_grad():
-            vec = model.get_image_features(**inputs).cpu().numpy()
+            output = mod.get_image_features(**inputs)
+            tensor = _extract_tensor(output)
+            vec = tensor.cpu().numpy()
+            # L2-normalize vectors for cosine similarity
+            norms = np.maximum(np.linalg.norm(vec, axis=-1, keepdims=True), 1e-12)
+            vec = vec / norms
         embs.append(vec)
         for im in imgs:
             try:
@@ -66,13 +113,22 @@ def embed(paths: List[str], batch: int = 32) -> np.ndarray:
                 pass
     if embs:
         return np.vstack(embs)
-    hidden = getattr(model, "config", None)
-    hidden_size = getattr(hidden, "hidden_size", 0) if hidden else 0
+    _, mod = get_model_and_processor()
+    hidden = getattr(mod, "config", None)
+    hidden_size = (
+        getattr(hidden, "hidden_size", None)
+        or getattr(getattr(hidden, "vision_config", None), "hidden_size", 768)
+        or 768
+    )
     return np.zeros((0, hidden_size))
 
 
 def scan_images(
-    scan_paths: List[str], verbose: bool = False, prune: bool = False
+    scan_paths: List[str],
+    verbose: bool = False,
+    prune: bool = False,
+    progress_callback: Any = None,
+    cancel_event: Any = None,
 ) -> Dict:
     """
     Scan images under the provided scan_paths, updating the database with metadata and embeddings.
@@ -127,6 +183,11 @@ def scan_images(
     pruned_excluded = 0
 
     now = datetime.now(timezone.utc).isoformat()
+
+    if progress_callback:
+        progress_callback(0, len(allowed_images) if allowed_images else 1, "Checking records to prune...")
+    if cancel_event and cancel_event.is_set():
+        return {"success": False, "cancelled": True}
 
     with database.db.cursor() as cur:
         # Fetch all image records once
@@ -200,8 +261,19 @@ def scan_images(
                 known_paths.pop(p, None)
 
         # Scan allowed images
+        total_allowed = len(allowed_images)
         iterable = tqdm(allowed_images, desc="Scanning images", disable=not verbose)
-        for fp in iterable:
+        for idx, fp in enumerate(iterable, 1):
+            if cancel_event and cancel_event.is_set():
+                if verbose:
+                    print("Scan cancelled by user.")
+                break
+            if progress_callback and (idx % 3 == 0 or idx == total_allowed):
+                progress_callback(
+                    idx,
+                    total_allowed + (len(new_paths) if new_paths else 1),
+                    f"Scanning metadata: {Path(fp).name} ({idx}/{total_allowed})",
+                )
             try:
                 abs_fp = os.path.abspath(fp)
                 h = sha256_file(fp)
@@ -302,6 +374,13 @@ def scan_images(
 
         # Bulk insert new images
         if new_paths:
+            total_new = len(new_paths)
+            if progress_callback:
+                progress_callback(
+                    total_allowed,
+                    total_allowed + total_new,
+                    f"Generating SigLIP embeddings for {total_new} new images...",
+                )
             try:
                 if verbose:
                     print(f"Embedding {len(new_paths)} new images...")
@@ -313,7 +392,19 @@ def scan_images(
                 else:
                     with database.chroma_lock:
                         try:
-                            database.chroma_coll.add(ids=new_hashes, embeddings=vecs)
+                            # Deduplicate in case identical images exist in the batch
+                            unique_ids = []
+                            unique_vecs = []
+                            seen_ids = set()
+                            for uh, uv in zip(new_hashes, vecs):
+                                if uh not in seen_ids:
+                                    seen_ids.add(uh)
+                                    unique_ids.append(uh)
+                                    unique_vecs.append(uv)
+                            if unique_ids:
+                                database.chroma_coll.upsert(
+                                    ids=unique_ids, embeddings=np.array(unique_vecs)
+                                )
                         except Exception as e:
                             if verbose:
                                 print(f"⚠️ Failed to add embeddings to Chroma: {e}")
@@ -429,9 +520,18 @@ def scan_images(
                     else:
                         with database.chroma_lock:
                             try:
-                                database.chroma_coll.add(
-                                    ids=reindex_hashes, embeddings=vecs
-                                )
+                                unique_ids = []
+                                unique_vecs = []
+                                seen_ids = set()
+                                for uh, uv in zip(reindex_hashes, vecs):
+                                    if uh not in seen_ids:
+                                        seen_ids.add(uh)
+                                        unique_ids.append(uh)
+                                        unique_vecs.append(uv)
+                                if unique_ids:
+                                    database.chroma_coll.upsert(
+                                        ids=unique_ids, embeddings=np.array(unique_vecs)
+                                    )
                             except Exception as e:
                                 if verbose:
                                     print(f"⚠️ Failed to add reindex embeddings: {e}")
@@ -504,12 +604,19 @@ def scan_images(
     }
 
 
-def search_by_text(query: str, top_k: int = 5):
-    inputs = processor(text=[query], return_tensors="pt", padding="max_length").to(
+def search_by_text(query: str, top_k: int = 5, min_score: float = None):
+    proc, mod = get_model_and_processor()
+    inputs = proc(text=[query], return_tensors="pt", padding="max_length").to(
         DEVICE
     )
     with torch.no_grad():
-        vec = model.get_text_features(**inputs).cpu().numpy()
+        output = mod.get_text_features(**inputs)
+        tensor = _extract_tensor(output)
+        vec = tensor.cpu().numpy()
+        # L2-normalize query vector
+        norms = np.maximum(np.linalg.norm(vec, axis=-1, keepdims=True), 1e-12)
+        vec = vec / norms
+
     with database.chroma_lock:
         res = database.chroma_coll.query(query_embeddings=vec, n_results=top_k)
     ids, distances = res.get("ids", [[]])[0], res.get("distances", [[]])[0]
@@ -519,33 +626,41 @@ def search_by_text(query: str, top_k: int = 5):
     with database.db.cursor() as cur:
         cur.execute(
             f"SELECT f.hash, f.path, i.make, i.model, i.width, i.height, i.latitude, i.longitude, i.location_city, i.location_country "
-            + f"FROM files f JOIN images i ON f.id = i.file_id "
+            + f"FROM files f LEFT JOIN images i ON f.id = i.file_id "
             + f"WHERE f.hash IN ({placeholders})",
             ids,
         )
         rows = cur.fetchall()
     rows_dict = {row[0]: row for row in rows}
-    return [
-        {
-            "hash": h,
-            "distance": dist,
-            "path": rows_dict.get(h)[1],
-            "make": rows_dict.get(h)[2],
-            "model": rows_dict.get(h)[3],
-            "resolution": (
-                f"{rows_dict.get(h)[4]}x{rows_dict.get(h)[5]}"
-                if rows_dict.get(h)[4] and rows_dict.get(h)[5]
-                else None
-            ),
-            "city": rows_dict.get(h)[8],
-            "country": rows_dict.get(h)[9],
-        }
-        for h, dist in zip(ids, distances)
-        if h in rows_dict
-    ]
+
+    results = []
+    for h, dist in zip(ids, distances):
+        if h in rows_dict:
+            similarity = round(float(1.0 - dist), 4)
+            if min_score is not None and similarity < min_score:
+                continue
+            row = rows_dict[h]
+            results.append(
+                {
+                    "hash": h,
+                    "distance": round(float(dist), 4),
+                    "similarity": similarity,
+                    "path": row[1],
+                    "make": row[2],
+                    "model": row[3],
+                    "resolution": (
+                        f"{row[4]}x{row[5]}"
+                        if row[4] and row[5]
+                        else None
+                    ),
+                    "city": row[8],
+                    "country": row[9],
+                }
+            )
+    return results
 
 
-def search_by_image(path: str, top_k: int = 5):
+def search_by_image(path: str, top_k: int = 5, min_score: float = None):
     vec = embed([path])
     if vec.shape[0] == 0:
         return []
@@ -558,30 +673,38 @@ def search_by_image(path: str, top_k: int = 5):
     with database.db.cursor() as cur:
         cur.execute(
             f"SELECT f.hash, f.path, i.make, i.model, i.width, i.height, i.latitude, i.longitude, i.location_city, i.location_country "
-            + f"FROM files f JOIN images i ON f.id = i.file_id "
+            + f"FROM files f LEFT JOIN images i ON f.id = i.file_id "
             + f"WHERE f.hash IN ({placeholders})",
             ids,
         )
         rows = cur.fetchall()
     rows_dict = {row[0]: row for row in rows}
-    return [
-        {
-            "hash": h,
-            "distance": dist,
-            "path": rows_dict.get(h)[1],
-            "make": rows_dict.get(h)[2],
-            "model": rows_dict.get(h)[3],
-            "resolution": (
-                f"{rows_dict.get(h)[4]}x{rows_dict.get(h)[5]}"
-                if rows_dict.get(h)[4] and rows_dict.get(h)[5]
-                else None
-            ),
-            "city": rows_dict.get(h)[8],
-            "country": rows_dict.get(h)[9],
-        }
-        for h, dist in zip(ids, distances)
-        if h in rows_dict
-    ]
+
+    results = []
+    for h, dist in zip(ids, distances):
+        if h in rows_dict:
+            similarity = round(float(1.0 - dist), 4)
+            if min_score is not None and similarity < min_score:
+                continue
+            row = rows_dict[h]
+            results.append(
+                {
+                    "hash": h,
+                    "distance": round(float(dist), 4),
+                    "similarity": similarity,
+                    "path": row[1],
+                    "make": row[2],
+                    "model": row[3],
+                    "resolution": (
+                        f"{row[4]}x{row[5]}"
+                        if row[4] and row[5]
+                        else None
+                    ),
+                    "city": row[8],
+                    "country": row[9],
+                }
+            )
+    return results
 
 
 def query_by_metadata(

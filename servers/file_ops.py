@@ -831,6 +831,56 @@ def search_image_by_metadata(
         return {"error": str(e)}
 
 
+@mcp.tool("export_images_metadata_csv")
+def export_images_metadata_csv(
+    output_path: str,
+    make: str = None,
+    model: str = None,
+    country: str = None,
+    city: str = None,
+    min_width: int = None,
+    min_height: int = None,
+    has_gps: bool = None,
+    limit: int = None,
+):
+    """
+    Exports indexed image EXIF/GPS metadata to a CSV file, with optional filters.
+    Streams in chunks with an atomic write, so the full table can be exported safely.
+    Args:
+    - output_path (str, required): Destination CSV path (must be inside an allowed path).
+    - make (str, optional): Filter by camera make (substring, case-insensitive).
+    - model (str, optional): Filter by camera model.
+    - country (str, optional): Filter by location country.
+    - city (str, optional): Filter by location city.
+    - min_width (int, optional): Min image width.
+    - min_height (int, optional): Min image height.
+    - has_gps (bool, optional): Only images with GPS (True) or without GPS (False).
+    - limit (int, optional): Max rows to export. Omit or null for all matching rows.
+    Returns: Dict with 'success', 'path', 'row_count'.
+    """
+    try:
+        dest = safe_path(output_path)
+        if dest.suffix.lower() != ".csv":
+            return {"error": "output_path must end with '.csv'"}
+        if limit is not None:
+            limit = int(limit)
+            if limit <= 0:
+                return {"error": "limit must be a positive integer or omitted"}
+        return image_utils.export_images_metadata_to_path(
+            str(dest),
+            make=make,
+            model=model,
+            country=country,
+            city=city,
+            min_width=min_width,
+            min_height=min_height,
+            has_gps=has_gps,
+            limit=limit,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @mcp.tool("inspect_image")
 def inspect_image(path: str) -> Dict[str, Any]:
     """

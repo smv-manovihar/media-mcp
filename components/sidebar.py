@@ -755,3 +755,128 @@ def _render_media_settings():
 
 
 
+    with st.expander("📤 Export Image Metadata (CSV)", expanded=False):
+        st.caption("Download the entire indexed images database (path, EXIF, GPS, location) as CSV. Exports stream in chunks, so any size is safe.")
+        try:
+            from utils import database as _db
+            with _db.db.cursor() as _cur:
+                _cur.execute("SELECT COUNT(*) FROM images")
+                _total_images = _cur.fetchone()[0]
+            st.caption(f"Indexed images: **{_total_images}**")
+        except Exception:
+            pass
+
+        f_make = st.text_input("Filter: camera make", key="export_filter_make", placeholder="e.g. Canon (blank = all)", autocomplete="off")
+        f_model = st.text_input("Filter: camera model", key="export_filter_model", placeholder="e.g. EOS (blank = all)", autocomplete="off")
+        f_country = st.text_input("Filter: country", key="export_filter_country", placeholder="blank = all", autocomplete="off")
+        f_city = st.text_input("Filter: city", key="export_filter_city", placeholder="blank = all", autocomplete="off")
+        f_gps = st.selectbox(
+            "GPS filter",
+            options=["All", "With GPS only", "Without GPS only"],
+            key="export_filter_gps",
+        )
+        f_limit_on = st.checkbox("Limit rows", value=False, key="export_limit_on", help="Off = export all matching rows.")
+        f_limit = None
+        if f_limit_on:
+            f_limit = st.number_input("Max rows", min_value=1, value=10000, step=1000, key="export_limit")
+
+        # Live matching-row count for the current filters (cheap COUNT query).
+        try:
+            from utils.metadata_export import count_images_metadata as _count_meta
+            _gps_preview = None
+            if f_gps == "With GPS only":
+                _gps_preview = True
+            elif f_gps == "Without GPS only":
+                _gps_preview = False
+            _match_count = _count_meta(
+                make=(f_make or "").strip() or None,
+                model=(f_model or "").strip() or None,
+                country=(f_country or "").strip() or None,
+                city=(f_city or "").strip() or None,
+                has_gps=_gps_preview,
+            )
+            _shown = min(_match_count, int(f_limit)) if f_limit_on and f_limit else _match_count
+            st.caption(f"Matching rows: **{_shown}**" + (" (limited)" if f_limit_on and f_limit and _match_count > int(f_limit) else ""))
+        except Exception:
+            pass
+
+        if st.button("Generate CSV", key="btn_generate_images_csv", width="stretch"):
+            import tempfile as _tf
+            from utils.metadata_export import export_images_metadata_to_path as _export_to_path
+            _gps = None
+            if f_gps == "With GPS only":
+                _gps = True
+            elif f_gps == "Without GPS only":
+                _gps = False
+            _limit = int(f_limit) if f_limit_on and f_limit else None
+            _tmp_path = None
+            try:
+                _fd, _tmp_path = _tf.mkstemp(suffix=".csv", prefix="images_metadata_")
+                import os as _os
+                _os.close(_fd)
+                _prog = st.progress(0.0, text="Starting export...")
+                def _cb(done, total):
+                    try:
+                        if total:
+                            _prog.progress(min(float(done) / float(total), 1.0), text=f"Exporting... {done}/{total} rows")
+                        else:
+                            _prog.progress(0.0, text=f"Exporting... {done} rows")
+                    except Exception:
+                        pass
+                _res = _export_to_path(
+                    _tmp_path,
+                    make=(f_make or "").strip() or None,
+                    model=(f_model or "").strip() or None,
+                    country=(f_country or "").strip() or None,
+                    city=(f_city or "").strip() or None,
+                    has_gps=_gps,
+                    limit=_limit,
+                    progress_callback=_cb,
+                )
+                _prog.empty()
+                # Keep only the file path in session state (not the CSV text)
+                # so huge exports don't duplicate memory.
+                _old = st.session_state.pop("images_csv_path", None)
+                if _old and _old != _res["path"]:
+                    try:
+                        import os as _os2
+                        _os2.unlink(_old)
+                    except Exception:
+                        pass
+                st.session_state["images_csv_path"] = _res["path"]
+                st.session_state["images_csv_count"] = _res["row_count"]
+                st.rerun()
+            except Exception as e:
+                try:
+                    _prog.empty()
+                except Exception:
+                    pass
+                try:
+                    if _tmp_path:
+                        import os as _os3
+                        _os3.unlink(_tmp_path)
+                except Exception:
+                    pass
+                st.error(f"❌ Export failed: {e}")
+
+        _csv_path = st.session_state.get("images_csv_path")
+        _csv_count = st.session_state.get("images_csv_count", 0)
+        if _csv_path:
+            try:
+                import os as _os4
+                _size = _os4.path.getsize(_csv_path)
+                st.success(f"Ready: {_csv_count} row(s), {_size / 1024:.0f} KB.")
+                if _size > 200 * 1024 * 1024:
+                    st.warning("File is over 200 MB — downloading may use lots of memory. Consider narrowing the filters.")
+                with open(_csv_path, "rb") as _fh:
+                    st.download_button(
+                        f"⬇️ Download images_metadata ({_csv_count} rows).csv",
+                        data=_fh.read(),
+                        file_name="images_metadata.csv",
+                        mime="text/csv",
+                        key="btn_download_images_csv",
+                        width="stretch",
+                    )
+            except Exception as e:
+                st.error(f"❌ Export file unavailable, please regenerate: {e}")
+                st.session_state.pop("images_csv_path", None)

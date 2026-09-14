@@ -766,6 +766,19 @@ def query_by_metadata(
     ]
 
 
+# --- CSV export helpers (torch-free implementation lives in metadata_export;
+# re-exported here for backwards compatibility) ---
+from utils.metadata_export import (
+    EXPORT_COLUMNS,
+    count_images_metadata,
+    fetch_images_metadata,
+    images_metadata_to_csv,
+    iter_images_metadata,
+    export_images_metadata_to_path,
+    write_images_metadata_csv,
+)
+
+
 if __name__ == "__main__":
     import argparse, pprint
 

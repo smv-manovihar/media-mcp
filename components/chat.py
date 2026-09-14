@@ -1,9 +1,13 @@
+# Updated chat.py with fix for reasoning_content parsing
 import streamlit as st
 import datetime
 import os
 from pathlib import Path
 from PIL import Image, ImageOps
 import re
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+import client.prompts as prompts  # Assuming this import is available; adjust path if needed
 
 
 def _display_image_with_exif_fix(image_path):
@@ -13,6 +17,10 @@ def _display_image_with_exif_fix(image_path):
     """
     try:
         img = Image.open(image_path)
+
+        # Convert palette images with transparency to RGBA to avoid PIL warnings
+        if img.mode == "P" and "transparency" in img.info:
+            img = img.convert("RGBA")
 
         # Fix orientation based on EXIF data
         img = ImageOps.exif_transpose(img)
@@ -307,27 +315,93 @@ def _process_agent_response(agent, agent_loop):
         message_placeholder = st.empty()
         image_container = st.container()  # Separate container for images
 
+        # Create dynamic prompt template with current date
+        date_str = f"Current Date and Time: {datetime.datetime.now()}"
+        system_prompt = prompts.sys + f"\n\n{date_str}"
+        prompt_template = ChatPromptTemplate.from_messages(
+            [
+                ("system", system_prompt),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )
+
         with st.spinner("🤔 Thinking..."):
             state = {"thoughts": "", "final_answer": "", "raw_final_answer": ""}
 
             async def stream_agent_response(state_dict):
-                inputs = {
-                    "messages": [
-                        ("system", f"Current Date and Time: {datetime.datetime.now()}")
-                    ]
-                    + [
-                        (msg["role"], _format_message_for_agent(msg))
-                        for msg in st.session_state.messages
-                    ]
-                }
+                # Prepare message tuples from history
+                message_tuples = [
+                    (
+                        msg["role"],
+                        (
+                            _format_message_for_agent(msg)
+                            if msg["role"] == "user"
+                            else msg["content"]
+                        ),
+                    )
+                    for msg in st.session_state.messages
+                ]
 
-                async for chunk in agent.astream(inputs):
-                    if "agent" in chunk:
-                        _process_agent_chunk(
-                            chunk, state_dict, thought_container, message_placeholder
+                # Format messages using the prompt template
+                formatted_messages = prompt_template.format_messages(
+                    messages=message_tuples
+                )
+
+                # Stream the agent
+                async for chunk in agent.astream(
+                    {"messages": formatted_messages}, stream_mode="values"
+                ):
+                    if "messages" not in chunk:
+                        continue
+                    latest_messages = chunk["messages"]
+                    if not latest_messages:
+                        continue
+                    latest_message = latest_messages[-1]
+
+                    if isinstance(latest_message, AIMessage):
+                        # Handle reasoning from additional_kwargs
+                        if "reasoning_content" in latest_message.additional_kwargs:
+                            reasoning = latest_message.additional_kwargs[
+                                "reasoning_content"
+                            ]
+                            formatted_reasoning = "\n".join(
+                                [f"> {line}" for line in reasoning.strip().split("\n")]
+                            )
+                            state_dict[
+                                "thoughts"
+                            ] += f"**Reasoning:**\n{formatted_reasoning}\n\n"
+                            thought_container.markdown(state_dict["thoughts"])
+
+                        # Handle content (final answer or additional content)
+                        if latest_message.content:
+                            if not latest_message.tool_calls:
+                                # Final answer (no tool calls)
+                                state_dict["raw_final_answer"] += latest_message.content
+                                state_dict["final_answer"] += latest_message.content
+                                message_placeholder.markdown(
+                                    state_dict["final_answer"] + "▌"
+                                )
+                            # If content is present with tool calls, it might be additional reasoning, but typically content is empty for tool calls
+
+                        # Handle tool calls
+                        if latest_message.tool_calls:
+                            for tc in latest_message.tool_calls:
+                                tool_call_md = (
+                                    f"**Tool Call:**\n"
+                                    f"- **Tool:** `{tc['name']}`\n"
+                                    f"- **Arguments:** `{tc['args']}`\n\n"
+                                )
+                                state_dict["thoughts"] += tool_call_md
+                                thought_container.markdown(state_dict["thoughts"])
+
+                    elif isinstance(latest_message, ToolMessage):
+                        # Handle tool output
+                        tool_output = latest_message.content
+                        tool_output_md = (
+                            f"**Tool Output:**\n```\n{tool_output}\n```\n\n"
                         )
-                    elif "tool" in chunk:
-                        _process_tool_chunk(chunk, state_dict, thought_container)
+                        state_dict["thoughts"] += tool_output_md
+                        thought_container.markdown(state_dict["thoughts"])
 
             agent_loop.run_until_complete(stream_agent_response(state))
 
@@ -368,61 +442,3 @@ def _format_message_for_agent(msg):
         f"---\n"
         f"Message content:\n{msg['content']}"
     )
-
-
-def _process_agent_chunk(chunk, state_dict, thought_container, message_placeholder):
-    """Process agent reasoning and tool calls."""
-    agent_step = chunk.get("agent", {})
-    messages = agent_step.get("messages")
-
-    if not messages:
-        return
-
-    last_message = messages[-1]
-
-    # Handle reasoning
-    if reasoning := last_message.additional_kwargs.get("reasoning_content"):
-        first_line = reasoning.split("\n")[0]
-        if first_line not in state_dict["thoughts"]:
-            formatted_reasoning = "\n".join(
-                [f"> {line}" for line in reasoning.strip().split("\n")]
-            )
-            state_dict["thoughts"] += f"**Reasoning:**\n{formatted_reasoning}\n\n"
-            thought_container.markdown(state_dict["thoughts"])
-
-    # Handle tool calls
-    if last_message.tool_calls:
-        for tc in last_message.tool_calls:
-            tool_call_md = (
-                f"**Tool Call:**\n"
-                f"- **Tool:** `{tc['name']}`\n"
-                f"- **Arguments:** `{tc['args']}`\n\n"
-            )
-            if tool_call_md not in state_dict["thoughts"]:
-                state_dict["thoughts"] += tool_call_md
-                thought_container.markdown(state_dict["thoughts"])
-
-    # Handle content streaming - store BOTH raw and display versions
-    if not last_message.tool_calls and last_message.content:
-        # Store raw content WITH image tags
-        state_dict["raw_final_answer"] += last_message.content
-
-        # For display, show streaming with cursor
-        state_dict["final_answer"] += last_message.content
-        message_placeholder.markdown(state_dict["final_answer"] + "▌")
-
-
-def _process_tool_chunk(chunk, state_dict, thought_container):
-    """Process tool execution output."""
-    tool_step = chunk.get("tool", {})
-    messages = tool_step.get("messages")
-
-    if not messages:
-        return
-
-    tool_output = messages[-1].content
-    tool_output_md = f"**Tool Output:**\n```\n{tool_output}\n```\n\n"
-
-    if tool_output_md not in state_dict["thoughts"]:
-        state_dict["thoughts"] += tool_output_md
-        thought_container.markdown(state_dict["thoughts"])

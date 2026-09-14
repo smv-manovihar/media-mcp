@@ -146,40 +146,83 @@ def scan_files(
 
             if abs_fp in known_paths:
                 # Case 1: Path known, check if modified
-                if h != known_paths[abs_fp]:
+                old_h = known_paths[abs_fp]
+                if h != old_h:
                     cur.execute(
                         "UPDATE files SET hash=?, file_size=?, updated_at=? WHERE path=?",
                         (h, file_size, now, abs_fp),
                     )
+                    # keep in-memory maps consistent
+                    # remove old hash -> path mapping
+                    known_hashes.pop(old_h, None)
+                    # set new mappings
+                    known_paths[abs_fp] = h
+                    known_hashes[h] = abs_fp
                     updated += 1
             elif h in known_hashes:
                 # Case 2: Hash known, file moved
+                old_path = known_hashes[h]
                 cur.execute(
                     "UPDATE files SET path=?, updated_at=? WHERE hash=?",
                     (abs_fp, now, h),
                 )
+                # update in-memory maps: remove old path, set new path
+                known_hashes[h] = abs_fp
+                known_paths.pop(old_path, None)
+                known_paths[abs_fp] = h
                 updated += 1
             else:
-                # Case 3: New file
+                # Case 3: New file (tentative — final filtering before insert)
                 file_type = get_file_type(fp)
                 new_files_data.append((h, abs_fp, file_type, file_size, now, now))
+                # update in-memory maps to avoid later duplicate work in same run
+                known_hashes[h] = abs_fp
+                known_paths[abs_fp] = h
 
-        # Bulk insert new files
-        if new_files_data:
-            cur.executemany(
-                "INSERT INTO files (hash, path, file_type, file_size, added_at, updated_at) VALUES (?,?,?,?,?,?)",
-                new_files_data,
-            )
-            if verbose:
-                print(f"✓ Added {len(new_files_data)} new file records.")
+        # Before bulk insert, filter out any entries whose path now exists in DB
+        filtered_new_files = []
+        for entry in new_files_data:
+            _, path, _, _, _, _ = entry
+            cur.execute("SELECT 1 FROM files WHERE path=? LIMIT 1", (path,))
+            if cur.fetchone():
+                if verbose:
+                    print(f"⚠️ Skipping insert for already-existing path: {path}")
+                continue
+            filtered_new_files.append(entry)
 
+        # Bulk insert new files safely
+        inserted = 0
+        if filtered_new_files:
+            try:
+                cur.executemany(
+                    "INSERT INTO files (hash, path, file_type, file_size, added_at, updated_at) VALUES (?,?,?,?,?,?)",
+                    filtered_new_files,
+                )
+                inserted = len(filtered_new_files)
+            except Exception as e:
+                # Fallback: try inserting one-by-one and skip duplicates (defensive)
+                if verbose:
+                    print(f"⚠️ Bulk insert failed ({e}), attempting individual inserts.")
+                for entry in filtered_new_files:
+                    try:
+                        cur.execute(
+                            "INSERT INTO files (hash, path, file_type, file_size, added_at, updated_at) VALUES (?,?,?,?,?,?)",
+                            entry,
+                        )
+                        inserted += 1
+                    except Exception as e2:
+                        if verbose:
+                            print(f"⚠️ Skipped insert for {entry[1]}: {e2}")
+
+        if inserted and verbose:
+            print(f"✓ Added {inserted} new file records.")
         if updated and verbose:
             print(f"✓ Updated {updated} moved or modified files.")
 
     return {
         "scan_type": "all_files",
         "found": len(all_files),
-        "new": len(new_files_data),
+        "new": inserted,
         "updated": updated,
         "deleted": pruned_deleted,
         "excluded": pruned_excluded + scan_excluded,

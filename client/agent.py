@@ -1,72 +1,98 @@
+# Modified agent.py (simplified, removed wrapper and prompt handling)
 import streamlit as st
 import os
 import asyncio
 from dotenv import load_dotenv
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+from requests.exceptions import RequestException
 
 from langchain_groq import ChatGroq
-from langgraph.prebuilt import create_react_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import create_agent
 import client.prompts as prompts
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 
-@st.cache_resource
-def init_agent():
+@st.cache_resource(ttl=3600)  # Cache for 1 hour
+def init_agent(_cache_key=None):
     """
-    Initialize the MCP client, tools, and the conversational agent.
+    Initialize the MCP client, tools, and the conversational ReAct agent.
     This function is cached to prevent re-initialization on every interaction.
+    The event loop is kept open for use in chat.py and closed on cache cleanup.
     """
     load_dotenv()
+    loop = None
     try:
-        # Configure the client to connect to your tool servers
-        client = MultiServerMCPClient(
-            {
-                "file_management": {
-                    "url": "http://localhost:8000/mcp",
-                    "transport": "streamable_http",
-                },
-                "web_search_scraper": {
-                    "url": "http://localhost:8001/mcp",
-                    "transport": "streamable_http",
-                },
-            }
+        # Define server configurations
+        servers = {
+            "file_management": {
+                "url": "http://localhost:8000/mcp",
+                "transport": "streamable_http",
+                "timeout": 10,
+            },
+            "web_search_scraper": {
+                "url": "http://localhost:8001/mcp",
+                "transport": "streamable_http",
+                "timeout": 10,
+            },
+        }
+
+        # Configure the client with retry logic
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=4, max=10),
+            retry=retry_if_exception_type(RequestException),
         )
-        # Set up an asyncio event loop for asynchronous operations
+        async def get_tools_with_retry(client):
+            return await client.get_tools()
+
+        # Initialize client
+        client = MultiServerMCPClient(servers)
+
+        # Set up event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        tools = loop.run_until_complete(client.get_tools())
+        tools = loop.run_until_complete(get_tools_with_retry(client))
 
         if not tools:
-            st.error("Failed to fetch any tools from the MCP servers.")
+            st.error("Failed to fetch any tools from the MCP servers after retries.")
             return None, None
 
-        # Get the Groq API key from environment variables
+        # Get the Groq API key
         groq_key = os.getenv("GROQ_API_KEY")
         if not groq_key:
             st.error("GROQ_API_KEY environment variable not set!")
             return None, None
 
         # Initialize the language model
-        model = ChatGroq(api_key=groq_key, model="qwen/qwen3-32b")
+        model = ChatGroq(api_key=groq_key, model="qwen/qwen3.8-27b")
 
-        prompt_template = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    prompts.sys,
-                ),
-                MessagesPlaceholder(variable_name="messages"),
-            ]
-        )
-
-        # Create the ReAct agent
-        agent_executor = create_react_agent(
+        # Create the ReAct agent (no system_prompt here; handled dynamically in chat.py)
+        agent = create_agent(
             model=model,
             tools=tools,
-            prompt=prompt_template,
         )
 
-        return agent_executor, loop
+        return agent, loop
+
     except Exception as e:
         st.error(f"Failed to initialize agent. Is an MCP server running? Error: {e}")
+        if loop and not loop.is_closed():
+            loop.close()
         return None, None
+
+    # Note: Do not close the loop here; it will be closed on cache cleanup
+
+
+def _cleanup_agent(agent_executor, loop):
+    """Cleanup function to close the event loop when the cache is cleared."""
+    if loop and not loop.is_closed():
+        loop.close()
+
+
+# Register cleanup callback with cache_resource
+init_agent.cleanup = _cleanup_agent

@@ -47,7 +47,14 @@ processor, model = load_model()
 def embed(paths: List[str], batch: int = 32) -> np.ndarray:
     embs = []
     for i in range(0, len(paths), batch):
-        imgs = [Image.open(p).convert("RGB") for p in paths[i : i + batch]]
+        imgs = []
+        for p in paths[i : i + batch]:
+            img = Image.open(p)
+            # Convert palette images with transparency to RGBA to avoid PIL warnings
+            if img.mode == "P" and "transparency" in img.info:
+                img = img.convert("RGBA")
+            img = img.convert("RGB")
+            imgs.append(img)
         inputs = processor(images=imgs, return_tensors="pt").to(DEVICE)
         with torch.no_grad():
             vec = model.get_image_features(**inputs).cpu().numpy()
@@ -144,7 +151,6 @@ def scan_images(
                 except Exception:
                     to_prune.append((h, "excluded"))
         else:
-            # Global deletions (like scan_files)
             candidates_deleted = db_paths - found_paths_on_disk
             for path in candidates_deleted:
                 if not os.path.exists(path):

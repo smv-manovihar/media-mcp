@@ -11,7 +11,11 @@ from transformers.utils import logging as hf_logging
 
 from utils import exif_utils, database
 from helpers.helpers import sha256_file, list_images, get_file_type
-from config.settings import load_config, should_exclude
+from config.settings import (
+    load_config,
+    compile_exclusions,
+    should_exclude_compiled,
+)
 
 
 # --- Constants ---
@@ -145,6 +149,13 @@ def scan_images(
         scan_paths = []
     scan_paths_abs = [os.path.abspath(p) for p in scan_paths]
     config = load_config()
+    excl_names, excl_globs = compile_exclusions(config)
+
+    def _excluded(abs_path: str) -> bool:
+        try:
+            return should_exclude_compiled(Path(abs_path), excl_names, excl_globs)
+        except Exception:
+            return True
 
     if not scan_paths_abs and not prune:
         return {
@@ -157,20 +168,14 @@ def scan_images(
             "excluded_media_count": 0,
         }
 
-    all_images = list_images(scan_paths_abs) if scan_paths_abs else []
+    all_images = list_images(scan_paths_abs, config=config) if scan_paths_abs else []
     found_paths_on_disk = {os.path.abspath(fp) for fp in all_images}
 
     allowed_images = []
     excluded_count = 0
     for fp in all_images:
         abs_fp = os.path.abspath(fp)
-        try:
-            if should_exclude(Path(abs_fp), config):
-                excluded_count += 1
-                continue
-        except Exception as e:
-            if verbose:
-                print(f"⚠️ Skipped image {fp}: Exclusion check failed - {str(e)}")
+        if _excluded(abs_fp):
             excluded_count += 1
             continue
         allowed_images.append(fp)
@@ -197,7 +202,17 @@ def scan_images(
         known_paths = {rec[1]: (rec[0], rec[2]) for rec in db_records}
         db_paths = set(known_paths.keys())
 
-        # Pruning: global deletions + local/global exclusions
+        # Sparse set: only track IDs that actually need metadata or dimensions (typically empty)
+        cur.execute("""
+            SELECT f.id FROM files f
+            LEFT JOIN images i ON f.id = i.file_id
+            WHERE f.file_type = 'image' AND (i.file_id IS NULL OR i.width IS NULL)
+        """)
+        needs_meta_ids = set(r[0] for r in cur.fetchall())
+
+        # Pruning: global deletions + local/global exclusions.
+        # Existence is checked before exclusions so missing files
+        # short-circuit to "deleted" without running the exclusion matcher.
         to_prune: List[tuple[str, str]] = []
         if prune:
             # Global prune: check all DB records
@@ -206,10 +221,7 @@ def scan_images(
                 if not os.path.exists(abs_p):
                     to_prune.append((h, "deleted"))
                     continue
-                try:
-                    if should_exclude(Path(abs_p), config):
-                        to_prune.append((h, "excluded"))
-                except Exception:
+                if _excluded(abs_p):
                     to_prune.append((h, "excluded"))
         else:
             candidates_deleted = db_paths - found_paths_on_disk
@@ -221,11 +233,7 @@ def scan_images(
             # Local exclusions: only on paths found in scan
             local_paths_to_check = db_paths & found_paths_on_disk
             for path in local_paths_to_check:
-                try:
-                    if should_exclude(Path(path), config):
-                        h = known_paths[path][0]
-                        to_prune.append((h, "excluded"))
-                except Exception:
+                if _excluded(path):
                     h = known_paths[path][0]
                     to_prune.append((h, "excluded"))
 
@@ -293,15 +301,20 @@ def scan_images(
                 metadata = exif_utils.get_exif_data(fp)
                 if "error" in metadata:
                     if verbose:
-                        print(f"⚠️ Skipped image {fp}: EXIF read error")
-                    skipped_for_error += 1
-                    metadata = {}  # Proceed with empty metadata
+                        print(f"⚠️ Warning: Could not read metadata for {fp}: {metadata.get('error')}")
+                    try:
+                        with Image.open(fp) as _img:
+                            metadata = {"width": _img.width, "height": _img.height}
+                    except Exception:
+                        metadata = {}
             except Exception as e:
                 if verbose:
-                    print(f"⚠️ Skipped image {fp}: EXIF processing error - {str(e)}")
-                skipped_for_error += 1
-                metadata = {}
-                continue
+                    print(f"⚠️ EXIF processing error for {fp}: {str(e)}")
+                try:
+                    with Image.open(fp) as _img:
+                        metadata = {"width": _img.width, "height": _img.height}
+                except Exception:
+                    metadata = {}
 
             if abs_fp in known_paths:
                 # Case 1: Path known, check if modified
@@ -347,12 +360,54 @@ def scan_images(
                                 metadata.get("location_postcode"),
                             ),
                         )
+                        needs_meta_ids.discard(file_id)
                         updated += 1
                     except Exception as e:
                         if verbose:
                             print(f"⚠️ Failed to update image {fp}: {str(e)}")
                         skipped_for_error += 1
                         continue
+                elif file_id in needs_meta_ids:
+                    # Sparse update: image exists in files table but is missing metadata or dimensions
+                    try:
+                        cur.execute(
+                            """INSERT OR REPLACE INTO images (file_id, make, model, software,
+                            width, height, orientation, datetime_original, datetime_digitized,
+                            exposure_time, f_number, iso, focal_length, flash,
+                            latitude, longitude, altitude, gps_timestamp,
+                            location_display_name, location_country, location_state, location_city, location_postcode)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                file_id,
+                                metadata.get("make"),
+                                metadata.get("model"),
+                                metadata.get("software"),
+                                metadata.get("width"),
+                                metadata.get("height"),
+                                metadata.get("orientation"),
+                                metadata.get("datetime_original"),
+                                metadata.get("datetime_digitized"),
+                                metadata.get("exposure_time"),
+                                metadata.get("f_number"),
+                                metadata.get("iso"),
+                                metadata.get("focal_length"),
+                                metadata.get("flash"),
+                                metadata.get("latitude"),
+                                metadata.get("longitude"),
+                                metadata.get("altitude"),
+                                metadata.get("gps_timestamp"),
+                                metadata.get("location_display_name"),
+                                metadata.get("location_country"),
+                                metadata.get("location_state"),
+                                metadata.get("location_city"),
+                                metadata.get("location_postcode"),
+                            ),
+                        )
+                        needs_meta_ids.discard(file_id)
+                        updated += 1
+                    except Exception as e:
+                        if verbose:
+                            print(f"⚠️ Failed to update metadata for image {fp}: {str(e)}")
             elif h in known_hashes:
                 # Case 2: Hash known, file moved
                 try:
@@ -472,12 +527,15 @@ def scan_images(
             print(f"✓ Updated {updated} moved or modified images")
 
         # Reindex images missing from images table
-        cur.execute("SELECT file_id FROM images")
-        existing_image_file_ids = set(r[0] for r in cur.fetchall())
+        cur.execute("""
+            SELECT f.hash, f.path, f.id
+            FROM files f LEFT JOIN images i ON f.id = i.file_id
+            WHERE f.file_type = 'image' AND i.file_id IS NULL
+        """)
         missing_file_rows = [
-            (h, os.path.abspath(path), file_id)
-            for h, (path, file_id) in known_hashes.items()
-            if file_id not in existing_image_file_ids and os.path.exists(path)
+            (h, os.path.abspath(p), fid)
+            for h, p, fid in cur.fetchall()
+            if os.path.exists(p)
         ]
 
         if missing_file_rows:
@@ -640,6 +698,17 @@ def search_by_text(query: str, top_k: int = 5, min_score: float = None):
             if min_score is not None and similarity < min_score:
                 continue
             row = rows_dict[h]
+            res_val = (
+                f"{row[4]}x{row[5]}"
+                if row[4] and row[5]
+                else None
+            )
+            if not res_val and row[1] and os.path.exists(row[1]):
+                try:
+                    with Image.open(row[1]) as im:
+                        res_val = f"{im.width}x{im.height}"
+                except Exception:
+                    pass
             results.append(
                 {
                     "hash": h,
@@ -648,11 +717,7 @@ def search_by_text(query: str, top_k: int = 5, min_score: float = None):
                     "path": row[1],
                     "make": row[2],
                     "model": row[3],
-                    "resolution": (
-                        f"{row[4]}x{row[5]}"
-                        if row[4] and row[5]
-                        else None
-                    ),
+                    "resolution": res_val,
                     "city": row[8],
                     "country": row[9],
                 }
@@ -687,6 +752,17 @@ def search_by_image(path: str, top_k: int = 5, min_score: float = None):
             if min_score is not None and similarity < min_score:
                 continue
             row = rows_dict[h]
+            res_val = (
+                f"{row[4]}x{row[5]}"
+                if row[4] and row[5]
+                else None
+            )
+            if not res_val and row[1] and os.path.exists(row[1]):
+                try:
+                    with Image.open(row[1]) as im:
+                        res_val = f"{im.width}x{im.height}"
+                except Exception:
+                    pass
             results.append(
                 {
                     "hash": h,
@@ -695,11 +771,7 @@ def search_by_image(path: str, top_k: int = 5, min_score: float = None):
                     "path": row[1],
                     "make": row[2],
                     "model": row[3],
-                    "resolution": (
-                        f"{row[4]}x{row[5]}"
-                        if row[4] and row[5]
-                        else None
-                    ),
+                    "resolution": res_val,
                     "city": row[8],
                     "country": row[9],
                 }
@@ -752,18 +824,27 @@ def query_by_metadata(
             params,
         )
         rows = cur.fetchall()
-    return [
-        {
-            "path": r[1],
-            "make": r[2],
-            "model": r[3],
-            "resolution": f"{r[4]}x{r[5]}" if r[4] and r[5] else None,
-            "city": r[8],
-            "country": r[9],
-            "datetime": r[10],
-        }
-        for r in rows
-    ]
+    results = []
+    for r in rows:
+        res_val = f"{r[4]}x{r[5]}" if r[4] and r[5] else None
+        if not res_val and r[1] and os.path.exists(r[1]):
+            try:
+                with Image.open(r[1]) as im:
+                    res_val = f"{im.width}x{im.height}"
+            except Exception:
+                pass
+        results.append(
+            {
+                "path": r[1],
+                "make": r[2],
+                "model": r[3],
+                "resolution": res_val,
+                "city": r[8],
+                "country": r[9],
+                "datetime": r[10],
+            }
+        )
+    return results
 
 
 # --- CSV export helpers (torch-free implementation lives in metadata_export;

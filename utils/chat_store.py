@@ -156,20 +156,59 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
 def get_session_messages(session_id: str) -> List[Dict[str, Any]]:
     """Load all messages for a session from SQLite, formatted for Streamlit."""
     with database.db.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, role, content, reasoning, tool_calls, file_path, timestamp, created_at
-            FROM chat_messages
-            WHERE session_id = ?
-            ORDER BY created_at ASC
-            """,
-            (session_id,),
-        )
-        rows = cur.fetchall()
+        try:
+            cur.execute(
+                """
+                SELECT id, role, content, reasoning, monologue, tool_calls, file_path, provider, model, token_usage, timestamp, created_at
+                FROM chat_messages
+                WHERE session_id = ?
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            )
+            rows = cur.fetchall()
+            schema_version = 3
+        except Exception:
+            try:
+                cur.execute(
+                    """
+                    SELECT id, role, content, reasoning, monologue, tool_calls, file_path, timestamp, created_at
+                    FROM chat_messages
+                    WHERE session_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (session_id,),
+                )
+                rows = cur.fetchall()
+                schema_version = 2
+            except Exception:
+                cur.execute(
+                    """
+                    SELECT id, role, content, reasoning, tool_calls, file_path, timestamp, created_at
+                    FROM chat_messages
+                    WHERE session_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (session_id,),
+                )
+                rows = cur.fetchall()
+                schema_version = 1
 
     messages = []
     for r in rows:
-        msg_id, role, content, reasoning, tool_calls_raw, file_path_raw, timestamp, created_at = r
+        if schema_version == 3:
+            msg_id, role, content, reasoning, monologue, tool_calls_raw, file_path_raw, provider, model, token_usage_raw, timestamp, created_at = r
+        elif schema_version == 2:
+            msg_id, role, content, reasoning, monologue, tool_calls_raw, file_path_raw, timestamp, created_at = r
+            provider = ""
+            model = ""
+            token_usage_raw = None
+        else:
+            msg_id, role, content, reasoning, tool_calls_raw, file_path_raw, timestamp, created_at = r
+            monologue = ""
+            provider = ""
+            model = ""
+            token_usage_raw = None
 
         tool_calls = []
         if tool_calls_raw:
@@ -185,13 +224,24 @@ def get_session_messages(session_id: str) -> List[Dict[str, Any]]:
             except Exception:
                 file_path = file_path_raw
 
+        token_usage = None
+        if token_usage_raw:
+            try:
+                token_usage = json.loads(token_usage_raw)
+            except Exception:
+                token_usage = None
+
         msg_dict = {
             "id": msg_id,
             "role": role,
             "content": content,
             "reasoning": reasoning or "",
+            "monologue": monologue or "",
             "tool_calls": tool_calls,
             "file_path": file_path,
+            "provider": provider or "",
+            "model": model or "",
+            "token_usage": token_usage,
             "timestamp": timestamp,
         }
         messages.append(msg_dict)
@@ -207,6 +257,10 @@ def add_message(
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     file_path: Any = None,
     timestamp: Optional[str] = None,
+    monologue: str = "",
+    provider: str = "",
+    model: str = "",
+    token_usage: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Save a user or assistant message into SQLite and update session metadata."""
     msg_id = str(uuid.uuid4())
@@ -220,6 +274,8 @@ def add_message(
         file_path_json = str(file_path)
     else:
         file_path_json = None
+
+    token_usage_json = json.dumps(token_usage) if token_usage else None
 
     with database.db.cursor() as cur:
         # Guarantee session exists in chat_sessions to prevent foreign key constraint violations
@@ -240,23 +296,68 @@ def add_message(
                 (session_id, default_title, now, now),
             )
 
-        cur.execute(
-            """
-            INSERT INTO chat_messages (id, session_id, role, content, reasoning, tool_calls, file_path, timestamp, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                msg_id,
-                session_id,
-                role,
-                content,
-                reasoning or "",
-                tool_calls_json,
-                file_path_json,
-                ts,
-                now,
-            ),
-        )
+        # Prefer full schema with provider, model, token_usage;
+        # fall back to previous schemas for older DBs.
+        try:
+            cur.execute(
+                """
+                INSERT INTO chat_messages (id, session_id, role, content, reasoning, monologue, tool_calls, file_path, provider, model, token_usage, timestamp, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    msg_id,
+                    session_id,
+                    role,
+                    content,
+                    reasoning or "",
+                    monologue or "",
+                    tool_calls_json,
+                    file_path_json,
+                    provider or "",
+                    model or "",
+                    token_usage_json,
+                    ts,
+                    now,
+                ),
+            )
+        except Exception:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO chat_messages (id, session_id, role, content, reasoning, monologue, tool_calls, file_path, timestamp, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        msg_id,
+                        session_id,
+                        role,
+                        content,
+                        reasoning or "",
+                        monologue or "",
+                        tool_calls_json,
+                        file_path_json,
+                        ts,
+                        now,
+                    ),
+                )
+            except Exception:
+                cur.execute(
+                    """
+                    INSERT INTO chat_messages (id, session_id, role, content, reasoning, tool_calls, file_path, timestamp, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        msg_id,
+                        session_id,
+                        role,
+                        content,
+                        reasoning or "",
+                        tool_calls_json,
+                        file_path_json,
+                        ts,
+                        now,
+                    ),
+                )
 
         # Update session updated_at
         cur.execute(

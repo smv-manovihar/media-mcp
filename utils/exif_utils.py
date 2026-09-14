@@ -136,8 +136,17 @@ def get_exif_data(image_path: Path) -> Dict[str, Any]:
         # Convert palette images with transparency to RGBA to avoid PIL warnings
         if image.mode == "P" and "transparency" in image.info:
             image = image.convert("RGBA")
-        exif_data = image._getexif()
+        img_width, img_height = image.size
+        exif_data = None
+        if hasattr(image, "_getexif"):
+            try:
+                exif_data = image._getexif()
+            except Exception:
+                exif_data = None
+
         exif: Dict[str, Any] = {}
+        gps_info: Dict[str, Any] = {}
+        location = None
 
         if exif_data:
             for tag_id, value in exif_data.items():
@@ -161,49 +170,61 @@ def get_exif_data(image_path: Path) -> Dict[str, Any]:
             gps_info = get_gps_info(exif_data)
 
             # Optional: reverse geocode ONLY if we have coordinates
-            location = None
             if "latitude" in gps_info and "longitude" in gps_info:
                 location = reverse_geocode(gps_info["latitude"], gps_info["longitude"])
 
-            # Construct the specific meta dictionary
-            meta = {
-                "make": exif.get("Make"),
-                "model": exif.get("Model"),
-                "software": exif.get("Software"),
-                "width": exif.get("ExifImageWidth", exif.get("ImageWidth")),
-                "height": exif.get("ExifImageHeight", exif.get("ImageLength")),
-                "orientation": exif.get("Orientation"),
-                "datetime_original": exif.get("DateTimeOriginal"),
-                "datetime_digitized": exif.get("DateTimeDigitized"),
-                "exposure_time": exif.get("ExposureTime"),
-                "f_number": exif.get("FNumber"),
-                "iso": exif.get("ISOSpeedRatings"),
-                "focal_length": exif.get("FocalLength"),
-                "flash": exif.get("Flash"),
-                "latitude": gps_info.get("latitude"),
-                "longitude": gps_info.get("longitude"),
-                "altitude": gps_info.get("altitude"),
-                "gps_timestamp": gps_info.get("gps_timestamp"),
-                # Location info
-                "location_display_name": (
-                    location.get("location_display_name") if location else None
-                ),
-                "location_country": (
-                    location.get("location_country") if location else None
-                ),
-                "location_state": location.get("location_state") if location else None,
-                "location_city": location.get("location_city") if location else None,
-                "location_postcode": (
-                    location.get("location_postcode") if location else None
-                ),
-                "location_district": (
-                    location.get("location_district") if location else None
-                ),
-            }
+        # Determine dimensions: prefer valid EXIF dimensions if present, otherwise fallback to native image size
+        raw_width = exif.get("ExifImageWidth") or exif.get("ImageWidth")
+        raw_height = exif.get("ExifImageHeight") or exif.get("ImageLength")
 
-            return meta
+        final_width = (
+            int(raw_width)
+            if (raw_width and isinstance(raw_width, (int, float)) and raw_width > 0)
+            else img_width
+        )
+        final_height = (
+            int(raw_height)
+            if (raw_height and isinstance(raw_height, (int, float)) and raw_height > 0)
+            else img_height
+        )
 
-        return {"error": "No EXIF data found in image"}
+        # Construct the specific meta dictionary
+        meta = {
+            "make": exif.get("Make"),
+            "model": exif.get("Model"),
+            "software": exif.get("Software"),
+            "width": final_width,
+            "height": final_height,
+            "orientation": exif.get("Orientation"),
+            "datetime_original": exif.get("DateTimeOriginal"),
+            "datetime_digitized": exif.get("DateTimeDigitized"),
+            "exposure_time": exif.get("ExposureTime"),
+            "f_number": exif.get("FNumber"),
+            "iso": exif.get("ISOSpeedRatings"),
+            "focal_length": exif.get("FocalLength"),
+            "flash": exif.get("Flash"),
+            "latitude": gps_info.get("latitude"),
+            "longitude": gps_info.get("longitude"),
+            "altitude": gps_info.get("altitude"),
+            "gps_timestamp": gps_info.get("gps_timestamp"),
+            # Location info
+            "location_display_name": (
+                location.get("location_display_name") if location else None
+            ),
+            "location_country": (
+                location.get("location_country") if location else None
+            ),
+            "location_state": location.get("location_state") if location else None,
+            "location_city": location.get("location_city") if location else None,
+            "location_postcode": (
+                location.get("location_postcode") if location else None
+            ),
+            "location_district": (
+                location.get("location_district") if location else None
+            ),
+        }
+
+        return meta
 
     except Exception as e:
         return {"error": str(e)}

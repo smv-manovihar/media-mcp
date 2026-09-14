@@ -23,7 +23,10 @@ def get_llm_model(config):
     provider = (config.llm_provider or "openai").lower()
     model_name = config.llm_model or ""
     base_url = (config.llm_base_url or "").strip()
-    temperature = float(config.llm_temperature if config.llm_temperature is not None else 0.1)
+    # None means "provider default" — omit the param so the provider decides.
+    raw_temp = getattr(config, "llm_temperature", None)
+    temperature = None if raw_temp is None else float(raw_temp)
+    temp_kwargs = {} if temperature is None else {"temperature": temperature}
 
     # Resolve API Key: prioritize provider-specific key in config, then fallback to environment
     api_key = (config.get_api_key_for_provider(provider) or config.llm_api_key or "").strip()
@@ -40,7 +43,7 @@ def get_llm_model(config):
             model=model_name,
             api_key=api_key or "ollama",
             base_url=effective_base_url,
-            temperature=temperature,
+            **temp_kwargs,
         )
 
     if provider == "custom":
@@ -50,13 +53,19 @@ def get_llm_model(config):
             model=model_name,
             api_key=api_key or "custom",
             base_url=effective_base_url,
-            temperature=temperature,
+            **temp_kwargs,
         )
 
     if not api_key:
         provider_name = preset.get("name", provider.title())
         raise ValueError(
-            f"API key for {provider_name} is required. Please enter your API key in the Model & Provider Settings panel in the sidebar."
+            f"API key for {provider_name} is required. Please enter your API key in the AI Config panel in the sidebar."
+        )
+
+    if not model_name.strip():
+        provider_name = preset.get("name", provider.title())
+        raise ValueError(
+            f"Please select a model for {provider_name} in the AI Config panel in the sidebar."
         )
 
     if provider == "gemini":
@@ -64,7 +73,8 @@ def get_llm_model(config):
         return ChatGoogleGenerativeAI(
             model=model_name,
             google_api_key=api_key,
-            temperature=temperature,
+            max_retries=0,
+            **temp_kwargs,
         )
 
     if provider == "anthropic":
@@ -72,7 +82,7 @@ def get_llm_model(config):
         return ChatAnthropic(
             model=model_name,
             api_key=api_key,
-            temperature=temperature,
+            **temp_kwargs,
         )
 
     if provider == "groq":
@@ -82,7 +92,7 @@ def get_llm_model(config):
             model=model_name,
             api_key=api_key,
             base_url=effective_base_url,
-            temperature=temperature,
+            **temp_kwargs,
         )
 
     if provider == "openrouter":
@@ -92,16 +102,16 @@ def get_llm_model(config):
             model=model_name,
             api_key=api_key,
             base_url=effective_base_url,
-            temperature=temperature,
+            **temp_kwargs,
         )
 
     # Default: OpenAI
     effective_base_url = base_url or None
     from langchain_openai import ChatOpenAI
     is_reasoning_model = any(model_name.lower().startswith(p) for p in ("o1", "o3"))
-    kwargs = {}
-    if not is_reasoning_model:
-        kwargs["temperature"] = temperature
+    kwargs = dict(temp_kwargs)
+    if is_reasoning_model:
+        kwargs.pop("temperature", None)
     return ChatOpenAI(
         model=model_name,
         api_key=api_key,
@@ -110,17 +120,44 @@ def get_llm_model(config):
     )
 
 
+def config_fingerprint(config) -> tuple:
+    """Hashable fingerprint of the LLM settings — used as Streamlit cache key."""
+    import hashlib
+    provider = (config.llm_provider or "").lower()
+    try:
+        api_key = config.get_api_key_for_provider(provider) or config.llm_api_key or ""
+    except Exception:
+        api_key = ""
+    key_hash = hashlib.sha256(api_key.strip().encode()).hexdigest()[:12] if api_key else ""
+    raw_temp = getattr(config, "llm_temperature", None)
+    try:
+        temp_fp = "default" if raw_temp is None else float(raw_temp)
+    except (TypeError, ValueError):
+        temp_fp = "default"
+    return (
+        provider,
+        (config.llm_model or "").strip(),
+        (config.llm_base_url or "").strip(),
+        temp_fp,
+        key_hash,
+    )
+
+
 @st.cache_resource(ttl=3600)
-def init_agent(_cache_key=None):
+def init_agent(cache_key=None):
     """
     Initialize the MCP client, tools, and the conversational ReAct agent.
     This function is cached to prevent re-initialization on every interaction.
+    NOTE: `cache_key` must NOT start with underscore — Streamlit skips hashing
+    underscore-prefixed args, which previously caused stale provider reuse
+    (e.g. stuck on Gemini after switching to Groq). Pass config_fingerprint().
     The event loop is kept open for use in chat.py and closed on cache cleanup.
     """
     load_dotenv()
     loop = None
     try:
         config = load_config()
+        print(f"[init_agent] provider={config.llm_provider} model={config.llm_model} cache_key={cache_key}")
 
         # Define server configurations
         servers = {

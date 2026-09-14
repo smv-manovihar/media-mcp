@@ -79,6 +79,7 @@ def _initialize_schema():
                 path TEXT NOT NULL,
                 file_type TEXT, -- e.g., 'image', 'video', 'document'
                 file_size INTEGER,
+                file_mtime REAL, -- source file mtime (seconds since epoch) for fast change detection
                 added_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )"""
@@ -135,8 +136,12 @@ def _initialize_schema():
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 reasoning TEXT,
+                monologue TEXT,
                 tool_calls TEXT, -- JSON string
                 file_path TEXT, -- file path or JSON list
+                provider TEXT,
+                model TEXT,
+                token_usage TEXT, -- JSON string
                 timestamp TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
@@ -172,6 +177,29 @@ def _initialize_schema():
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at DESC)"
+        )
+
+        # --- Migration: monologue, provider, model, token_usage columns ---
+        for col in ("monologue", "provider", "model", "token_usage"):
+            try:
+                cur.execute(f"SELECT {col} FROM chat_messages LIMIT 1")
+            except Exception:
+                try:
+                    cur.execute(f"ALTER TABLE chat_messages ADD COLUMN {col} TEXT")
+                except Exception:
+                    pass
+
+        # --- Migration: file_mtime for fast stat-based change detection ---
+        # Lets incremental scans skip re-hashing large unchanged files (e.g. videos).
+        try:
+            cur.execute("SELECT file_mtime FROM files LIMIT 1")
+        except Exception:
+            try:
+                cur.execute("ALTER TABLE files ADD COLUMN file_mtime REAL")
+            except Exception:
+                pass
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_mtime ON files(file_mtime)"
         )
 
 

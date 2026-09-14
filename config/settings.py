@@ -1,5 +1,6 @@
 import json
 import fnmatch
+import re
 from pathlib import Path, PurePath
 from dataclasses import dataclass, field
 from typing import List, Any, Tuple, Optional
@@ -13,6 +14,7 @@ DEFAULT_UPLOADS_DIR = PROJECT_ROOT / "uploads"
 DEFAULT_ALLOWED_PATHS: List[Path] = [DEFAULT_UPLOADS_DIR]
 DEFAULT_MEDIA_INDEX_PATHS: List[Path] = []
 DEFAULT_EXCLUSIONS = [
+    # --- Dev caches, virtual environments, and dependencies ---
     "__pycache__",
     ".venv",
     "venv",
@@ -41,6 +43,7 @@ DEFAULT_EXCLUSIONS = [
     ".mvn",
     "bin",
     "obj",
+    # --- OS junk, logs, and temporary files ---
     ".DS_Store",
     "Thumbs.db",
     "desktop.ini",
@@ -50,6 +53,35 @@ DEFAULT_EXCLUSIONS = [
     "logs",
     "temp",
     "tmp",
+    # --- OS / system directories: never useful to index, often huge/slow ---
+    "Windows",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+    "AppData",
+    "$Recycle.Bin",
+    "System Volume Information",
+    "Recovery",
+    "$WinREAgent",
+    "PerfLogs",
+    "MSOCache",
+    "$GetCurrent",
+    "$Windows.~BT",
+    "$Windows.~WS",
+    ".Trash",
+    ".Spotlight-V100",
+    ".fseventsd",
+    ".DocumentRevisions-V100",
+    ".TemporaryItems",
+    # --- Locked OS system files & compiler debug artifacts ---
+    "*.sys",
+    "pagefile.sys",
+    "hiberfil.sys",
+    "swapfile.sys",
+    "*.pdb",
+    "*.ilk",
+    "*.pyc",
+    "*.pyo",
 ]
 
 
@@ -117,12 +149,66 @@ PROVIDER_DEFAULTS = {
 }
 
 
-def fetch_provider_models(provider: str, api_key: str = "", base_url: str = "") -> Tuple[List[str], Optional[str]]:
+# Non-text models to filter out from chat model lists across all providers:
+# audio/speech/music, image/video generation, embeddings, moderation/guardrails, and legacy completion models
+NON_TEXT_PATTERNS = (
+    # Audio, Speech, TTS, Music
+    "whisper", "tts", "transcribe", "speech", "audio", "orpheus", "voice", "sound",
+    "bark", "music", "lyria", "audiogen",
+    # Image & Video generation
+    "dall-e", "imagen", "flux", "diffusion", "image-gen", "video", "sora", "runway",
+    # Embeddings & Rerankers
+    "embedding", "embed", "bge-", "gte-", "e5-", "rerank",
+    # Moderation & Guardrails
+    "moderation", "guard", "safeguard",
+    # Legacy / Non-chat base completion engines
+    "babbage", "davinci", "curie", "ada",
+    # Robotics
+    "robotics",
+)
+
+
+def is_text_chat_model(model_name: str) -> bool:
+    """Returns True if the model name appears to be a text/chat LLM, not audio/image/embed."""
+    name_lower = (model_name or "").lower()
+    if not name_lower.strip():
+        return False
+    # Hyphenated/compound patterns (dall-e, image-gen, bge-, ...) match by substring.
+    for pattern in NON_TEXT_PATTERNS:
+        p = pattern.lower()
+        if re.search(r"[^a-z0-9]", p):
+            if p in name_lower:
+                return False
+    tokens = [t for t in re.split(r"[^a-z0-9]+", name_lower) if t]
+    if not tokens:
+        return True
+    for pattern in NON_TEXT_PATTERNS:
+        p = pattern.lower()
+        if re.search(r"[^a-z0-9]", p):
+            continue  # already handled above
+        if len(p) <= 4:
+            # Short patterns (ada, tts, sora, ...): exact token only,
+            # so "ada" doesn't kill unrelated names containing those letters.
+            if p in tokens:
+                return False
+        else:
+            # Longer patterns: exact token or token starting with the pattern
+            # (catches "embedding" for "embed", "guardrail" for "guard", ...).
+            if any(t == p or t.startswith(p) for t in tokens):
+                return False
+    return True
+
+
+def fetch_provider_models(provider: str, api_key: str = "", base_url: str = "", text_only: bool = True) -> Tuple[List[str], Optional[str]]:
     """
     Fetches the official list of available models directly from the provider's /models endpoint.
     Returns a tuple of (model_ids: List[str], error_message: Optional[str]).
+    When text_only is False, no text/chat filtering is applied (used for vision lists).
     """
     import requests
+
+    def _keep(mid: str) -> bool:
+        return is_text_chat_model(mid) if text_only else True
 
     provider = (provider or "openai").lower()
     preset = PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS["custom"])
@@ -160,13 +246,14 @@ def fetch_provider_models(provider: str, api_key: str = "", base_url: str = "") 
                         err_detail = resp.text[:120]
                     return [], f"HTTP {resp.status_code}: {err_detail}"
                 models_data = resp.json().get("models", [])
-                # Filter to generative (chat-capable) models only
+                # Filter to generative (chat-capable) text models only
                 model_ids = [
                     m["name"].replace("models/", "")
                     for m in models_data
                     if isinstance(m, dict)
                     and "generateContent" in m.get("supportedGenerationMethods", [])
                     and m.get("name", "")
+                    and _keep(m["name"])
                 ]
                 return sorted(model_ids), None
             except requests.exceptions.ConnectionError:
@@ -180,7 +267,11 @@ def fetch_provider_models(provider: str, api_key: str = "", base_url: str = "") 
             try:
                 resp = requests.get(f"{root_url}/api/tags", timeout=5)
                 if resp.status_code == 200:
-                    models = [m.get("name") for m in resp.json().get("models", []) if isinstance(m, dict) and m.get("name")]
+                    models = [
+                        m.get("name")
+                        for m in resp.json().get("models", [])
+                        if isinstance(m, dict) and m.get("name") and _keep(m.get("name"))
+                    ]
                     if models:
                         return sorted(models), None
             except Exception:
@@ -189,7 +280,11 @@ def fetch_provider_models(provider: str, api_key: str = "", base_url: str = "") 
             try:
                 resp = requests.get(f"{effective_url}/models", timeout=5)
                 if resp.status_code == 200:
-                    models = [m.get("id") for m in resp.json().get("data", []) if isinstance(m, dict) and m.get("id")]
+                    models = [
+                        m.get("id")
+                        for m in resp.json().get("data", [])
+                        if isinstance(m, dict) and m.get("id") and _keep(m.get("id"))
+                    ]
                     if models:
                         return sorted(models), None
             except Exception as e:
@@ -208,7 +303,11 @@ def fetch_provider_models(provider: str, api_key: str = "", base_url: str = "") 
                 return [], f"HTTP {resp.status_code}: {err_detail}"
 
             data = resp.json().get("data", [])
-            model_ids = [m.get("id") for m in data if isinstance(m, dict) and m.get("id")]
+            model_ids = [
+                m.get("id")
+                for m in data
+                if isinstance(m, dict) and m.get("id") and _keep(m.get("id"))
+            ]
             return sorted(model_ids), None
 
         # OpenAI, OpenRouter, Groq, Custom
@@ -243,17 +342,13 @@ def fetch_provider_models(provider: str, api_key: str = "", base_url: str = "") 
 
         model_ids = []
         for item in raw_list:
+            mid = None
             if isinstance(item, str):
-                model_ids.append(item)
+                mid = item
             elif isinstance(item, dict):
                 mid = item.get("id") or item.get("name") or item.get("model")
-                if mid:
-                    model_ids.append(str(mid))
-
-        if provider == "openai":
-            # Filter non-chat models
-            non_chat = ("whisper", "tts", "dall-e", "embedding", "moderation", "babbage", "davinci")
-            model_ids = [m for m in model_ids if not any(x in m for x in non_chat)]
+            if mid and _keep(str(mid)):
+                model_ids.append(str(mid))
 
         if not model_ids:
             return [], f"No models found from {url}"
@@ -282,13 +377,19 @@ class Config:
 
     # LLM Settings
     llm_provider: str = "openai"
-    llm_model: str = "gpt-4o"
+    llm_model: str = ""
     llm_base_url: str = ""
     llm_api_key: str = ""
-    llm_temperature: float = 0.1
+    llm_temperature: Optional[float] = None
     llm_keys: dict = field(default_factory=dict)
+    llm_models: dict = field(default_factory=dict)
     llm_custom_instructions: str = ""
     llm_system_prompt: str = ""
+
+    # Vision Model Settings (for inspect_image tool)
+    vision_provider: str = ""
+    vision_model: str = ""
+    vision_enabled: bool = False
 
     def __post_init__(self):
         # Keep custom instructions and legacy system prompt synchronized
@@ -330,6 +431,22 @@ class Config:
         if self.llm_provider == provider:
             self.llm_api_key = key
 
+    def get_model_for_provider(self, provider: str) -> str:
+        """Returns the saved model for a given provider, if any."""
+        if hasattr(self, "llm_models") and isinstance(self.llm_models, dict) and provider in self.llm_models:
+            return self.llm_models[provider]
+        if self.llm_provider == provider:
+            return self.llm_model
+        return ""
+
+    def set_model_for_provider(self, provider: str, model: str) -> None:
+        """Sets the model for a given provider in the models map."""
+        if not hasattr(self, "llm_models") or not isinstance(self.llm_models, dict):
+            self.llm_models = {}
+        self.llm_models[provider] = model
+        if self.llm_provider == provider:
+            self.llm_model = model
+
     def get(self, key: str, default: Any = None) -> Any:
         if hasattr(self, key):
             return getattr(self, key)
@@ -365,8 +482,12 @@ class Config:
                 "api_key": self.llm_api_key,
                 "temperature": self.llm_temperature,
                 "keys": self.llm_keys,
+                "models": getattr(self, "llm_models", {}),
                 "custom_instructions": self.llm_custom_instructions,
                 "system_prompt": self.llm_custom_instructions,
+                "vision_provider": self.vision_provider,
+                "vision_model": self.vision_model,
+                "vision_enabled": self.vision_enabled,
             },
         }
 
@@ -390,15 +511,32 @@ class Config:
         raw_keys = llm_data.get("keys", {})
         llm_keys = dict(raw_keys) if isinstance(raw_keys, dict) else {}
 
+        raw_models = llm_data.get("models", {})
+        llm_models = dict(raw_models) if isinstance(raw_models, dict) else {}
+
         api_key = llm_data.get("api_key", "")
         if not api_key and provider in llm_keys:
             api_key = llm_keys[provider]
         elif api_key and provider not in llm_keys:
             llm_keys[provider] = api_key
 
+        model_name = llm_data.get("model", "")
+        if not model_name and provider in llm_models:
+            model_name = llm_models[provider]
+        elif model_name and provider not in llm_models:
+            llm_models[provider] = model_name
+
         custom_instructions = llm_data.get(
             "custom_instructions", llm_data.get("system_prompt", "")
         )
+
+        # None (or missing) means "provider default" — temperature is omitted
+        # from model requests instead of forcing 0.1.
+        raw_temp = llm_data.get("temperature", None)
+        try:
+            llm_temperature = None if raw_temp is None else float(raw_temp)
+        except (TypeError, ValueError):
+            llm_temperature = None
 
         return cls(
             user_allowed_paths=_parse_paths(user_data.get("allowed_paths", [])),
@@ -411,13 +549,17 @@ class Config:
                 )
             ),
             llm_provider=provider,
-            llm_model=llm_data.get("model", ""),
+            llm_model=model_name,
             llm_base_url=llm_data.get("base_url", ""),
             llm_api_key=api_key,
-            llm_temperature=float(llm_data.get("temperature", 0.1)),
+            llm_temperature=llm_temperature,
             llm_keys=llm_keys,
+            llm_models=llm_models,
             llm_custom_instructions=custom_instructions,
             llm_system_prompt=custom_instructions,
+            vision_provider=llm_data.get("vision_provider", "") or "",
+            vision_model=llm_data.get("vision_model", ""),
+            vision_enabled=bool(llm_data.get("vision_enabled", False)),
         )
 
 
@@ -483,24 +625,43 @@ def save_config(config: Config) -> None:
     CONFIG_FILE_PATH.write_text(json.dumps(data_to_save, indent=4, cls=PathEncoder))
 
 
-def should_exclude(path: Path, config: Config) -> bool:
+def compile_exclusions(config: Config) -> Tuple[frozenset, tuple]:
     """
-    Checks if a given path should be excluded based on the config. This logic is
-    rewritten to be more accurate and efficient.
-    """
-    exclusions = config.all_exclusions
-    path_parts_set = set(path.parts)
-    path_name = path.name
+    Precompiled exclusion matcher for hot loops.
 
-    for pattern in exclusions:
-        # Check if the pattern is a glob or a simple name
-        is_glob = "*" in pattern or "?" in pattern or "[" in pattern
-        if is_glob:
-            # Glob patterns match only against the final file/directory name
-            if fnmatch.fnmatch(path_name, pattern):
-                return True
+    Returns (plain_names_lower, glob_patterns_lower). Plain names match any
+    path component case-insensitively; globs match the final file/dir name.
+    Compile once per scan instead of rebuilding per file.
+    """
+    names = set()
+    globs = []
+    for pattern in config.all_exclusions:
+        if "*" in pattern or "?" in pattern or "[" in pattern:
+            globs.append(pattern.lower())
         else:
-            # Simple name patterns match against any component of the path
-            if pattern in path_parts_set:
+            names.add(pattern.lower())
+    return frozenset(names), tuple(globs)
+
+
+def should_exclude_compiled(
+    path: Path, plain_names: frozenset, globs: tuple
+) -> bool:
+    """Exclusion check against a precompiled (names, globs) pair."""
+    if plain_names and plain_names.intersection(p.lower() for p in path.parts):
+        return True
+    if globs:
+        name_lower = path.name.lower()
+        for pattern in globs:
+            if fnmatch.fnmatch(name_lower, pattern):
                 return True
     return False
+
+
+def should_exclude(path: Path, config: Config) -> bool:
+    """
+    Checks if a given path should be excluded based on the config.
+    Matching is case-insensitive so e.g. 'Windows' also catches 'WINDOWS'.
+    For hot loops prefer compile_exclusions + should_exclude_compiled.
+    """
+    names, globs = compile_exclusions(config)
+    return should_exclude_compiled(path, names, globs)

@@ -2,9 +2,9 @@ import os
 import shutil
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Union, List, Dict, Any
+from typing import Union, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
-from config.settings import load_config
+from config.settings import load_config, PROVIDER_DEFAULTS
 from utils import database
 from helpers import helpers
 import utils.image_search_utils as image_utils
@@ -681,8 +681,8 @@ def search_files(
 
 
 # Image related tools
-@mcp.tool("search_image_by_text")
-def search_image_by_text(
+@mcp.tool("search_images_by_description")
+def search_images_by_description(
     query: str,
     top_k: int = 5,
     page: int = 1,
@@ -733,8 +733,8 @@ def search_image_by_text(
         return {"error": str(e)}
 
 
-@mcp.tool("search_by_image")
-def search_by_image(
+@mcp.tool("search_images_by_image")
+def search_images_by_image(
     path: str, top_k: int = 5, page: int = 1, page_size: int = 10, min_score: float = None
 ):
     """
@@ -780,8 +780,8 @@ def search_by_image(
         return {"error": str(e)}
 
 
-@mcp.tool("search_image_by_metadata")
-def search_image_by_metadata(
+@mcp.tool("search_images_by_metadata")
+def search_images_by_metadata(
     make: str = None,
     model: str = None,
     country: str = None,
@@ -881,8 +881,174 @@ def export_images_metadata_csv(
         return {"error": str(e)}
 
 
+def _extract_llm_text(resp: Any) -> str:
+    """Extract plain text from a LangChain chat response (content may be str or blocks)."""
+    content = getattr(resp, "content", resp)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item.get("text") or ""))
+            else:
+                t = getattr(item, "text", None)
+                if isinstance(t, str) and t:
+                    parts.append(t)
+        joined = "".join(parts).strip()
+        return joined if joined else str(content).strip()
+    return str(content).strip()
+
+
+def _call_vision_model(file_path: Path, cfg, question: str = "") -> Tuple[str, str]:
+    """
+    Sends the image to the configured vision-capable LLM.
+    Returns (description, status): description is the model text ("" when unavailable),
+    status is "ok" or an explicit machine-readable reason ("disabled: ...",
+    "not_configured: ...", "no_key: ...", "read_error: ...", "query_failed: ...").
+    Uses the dedicated vision provider / API key when set, otherwise falls
+    back to the main chat provider.
+    """
+    import base64
+
+    provider = (
+        getattr(cfg, "vision_provider", "") or getattr(cfg, "llm_provider", "") or "openai"
+    ).lower()
+    model = (getattr(cfg, "vision_model", "") or "").strip()
+    if not getattr(cfg, "vision_enabled", False):
+        return "", "disabled: vision model is turned off in AI settings (Visual AI)"
+    if not model:
+        return "", "not_configured: vision model name is empty in AI settings (Visual AI)"
+
+    preset = PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS.get("custom", {}))
+
+    # Resolve API Key: prioritize provider-specific key in config, then fallback to environment
+    api_key = (
+        (cfg.get_api_key_for_provider(provider) if hasattr(cfg, "get_api_key_for_provider") else "")
+        or ""
+    ).strip()
+    main_provider = (getattr(cfg, "llm_provider", "") or "").lower()
+    if not api_key and provider == main_provider:
+        api_key = (getattr(cfg, "llm_api_key", "") or "").strip()
+    env_var = preset.get("env_key")
+    if not api_key and env_var:
+        api_key = (os.getenv(env_var) or "").strip()
+    if not api_key and preset.get("requires_api_key", False) and provider != "ollama":
+        return "", (
+            f"no_key: no API key saved for vision provider '{provider}'. "
+            f"Add it under Provider & Credentials, or pick a different vision provider."
+        )
+
+    if provider == main_provider:
+        base_url = (getattr(cfg, "llm_base_url", "") or preset.get("base_url", "") or "").strip()
+    else:
+        base_url = (preset.get("base_url", "") or "").strip()
+
+    # Read and base64-encode the image
+    try:
+        image_bytes = file_path.read_bytes()
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        suffix = file_path.suffix.lower().lstrip(".")
+        mime_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif",
+            "webp": "image/webp", "bmp": "image/bmp",
+        }
+        mime_type = mime_map.get(suffix, "image/jpeg")
+    except Exception as e:
+        print(f"[Vision Model Error] Failed to read/encode image '{file_path.name}': {e}")
+        return "", f"read_error: could not read image file '{file_path.name}': {e}"
+
+    extra = (question or "").strip()
+    if extra:
+        prompt = (
+            "Answer the following question about this image. Be concise but specific. "
+            f"Question: {extra}\n\n"
+            "Also give a one-sentence overall description of the scene."
+        )
+    else:
+        prompt = (
+            "Describe this image in detail. Include: what is shown, the scene or setting, "
+            "notable objects, people, colors, mood, and any readable text. Be concise but thorough."
+        )
+
+    try:
+        from langchain_core.messages import HumanMessage
+
+        # Standard LangChain multimodal HumanMessage with image_url data URI
+        msg = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{b64_image}"},
+                },
+            ]
+        )
+
+        if provider == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(
+                model=model,
+                google_api_key=api_key,
+                temperature=0.1,
+            )
+            resp = llm.invoke([msg])
+            text = _extract_llm_text(resp)
+            if text:
+                return text, "ok"
+            return "", f"empty_response: vision model '{model}' returned no text"
+
+        elif provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+            llm = ChatAnthropic(
+                model=model,
+                api_key=api_key,
+                temperature=0.1,
+            )
+            resp = llm.invoke([msg])
+            text = _extract_llm_text(resp)
+            if text:
+                return text, "ok"
+            return "", f"empty_response: vision model '{model}' returned no text"
+
+        else:
+            # OpenAI / OpenRouter / Groq / Ollama / Custom (OpenAI-compatible)
+            from langchain_openai import ChatOpenAI
+            kwargs = {"api_key": api_key or "no-key", "temperature": 0.1}
+            if base_url:
+                kwargs["base_url"] = base_url
+            elif provider == "openrouter":
+                kwargs["base_url"] = "https://openrouter.ai/api/v1"
+            elif provider == "groq":
+                kwargs["base_url"] = "https://api.groq.com/openai/v1"
+            elif provider == "ollama":
+                kwargs["base_url"] = "http://localhost:11434/v1"
+                kwargs["api_key"] = "ollama"
+
+            llm = ChatOpenAI(
+                model=model,
+                **kwargs,
+            )
+            resp = llm.invoke([msg])
+            text = _extract_llm_text(resp)
+            if text:
+                return text, "ok"
+            return "", f"empty_response: vision model '{model}' returned no text"
+
+    except Exception as e:
+        print(f"[Vision Model Error] Failed to query {provider} vision model '{model}': {e}")
+        return "", (
+            f"query_failed: vision provider '{provider}' model '{model}' error: {e}. "
+            f"Check the model name exists on that provider and the API key is valid."
+        )
+
+
 @mcp.tool("inspect_image")
-def inspect_image(path: str) -> Dict[str, Any]:
+def inspect_image(path: str, question: str = "") -> Dict[str, Any]:
     """
     Visually inspects and describes an image file on disk.
     Extracts dimensions, format, color space, camera EXIF metadata, GPS location,
@@ -890,7 +1056,14 @@ def inspect_image(path: str) -> Dict[str, Any]:
     Allows text-only LLMs to perceive and accurately describe image contents without raw pixels.
     Args:
     - path (str, required): Path to the image file.
-    Returns: Dict with structured visual properties, camera telemetry, geolocation, and semantic tags.
+    - question (str, optional): Specific question or detail to ask the vision model about
+      this image (e.g. "what does the sign say?", "is there a person wearing red?").
+      When empty, a general detailed description is returned.
+    Returns: Dict with structured visual properties, camera telemetry, geolocation,
+      semantic tags, vision_description (vision-model text or null when unavailable),
+      and vision_status (always present: "ok" or an explicit reason such as
+      "disabled: ...", "not_configured: ...", "no_key: ...", "query_failed: ...").
+      If vision_status is not "ok", treat vision_description as missing and say so.
     """
     try:
         file_path = safe_path(path)
@@ -991,6 +1164,29 @@ def inspect_image(path: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        # Vision model description (optional — only when configured).
+        # vision_status is ALWAYS set so the main model knows why the
+        # description is missing instead of seeing a bare null.
+        vision_description = None
+        vision_status = "disabled: vision model is turned off in AI settings (Visual AI)"
+        _cfg = load_config()
+        if getattr(_cfg, "vision_enabled", False) and getattr(_cfg, "vision_model", ""):
+            _desc, _status = _call_vision_model(file_path, _cfg, question=question)
+            vision_description = _desc or None
+            vision_status = _status
+        elif getattr(_cfg, "vision_enabled", False):
+            vision_status = "not_configured: vision model name is empty in AI settings (Visual AI)"
+
+        visual_sum = (
+            f"{orientation_desc.capitalize()} {fmt} image ({w}x{h}). "
+            f"Dominant palette: {', '.join(dominant_colors[:2]) if dominant_colors else 'N/A'}. "
+            f"Visual tags: {', '.join([t.split(' (')[0] for t in detected_tags[:3]]) if detected_tags else 'N/A'}."
+        )
+        if vision_description:
+            visual_sum += f" Vision description: {vision_description[:200]}{'...' if len(vision_description) > 200 else ''}"
+        elif vision_status != "disabled: vision model is turned off in AI settings (Visual AI)":
+            visual_sum += f" Vision model note: {vision_status}"
+
         return {
             "path": str(file_path),
             "filename": file_path.name,
@@ -1001,11 +1197,9 @@ def inspect_image(path: str) -> Dict[str, Any]:
             "dominant_palette": dominant_colors,
             "detected_visual_concepts": detected_tags,
             "exif_metadata": exif_summary,
-            "visual_summary": (
-                f"{orientation_desc.capitalize()} {fmt} image ({w}x{h}). "
-                f"Dominant palette: {', '.join(dominant_colors[:2]) if dominant_colors else 'N/A'}. "
-                f"Visual tags: {', '.join([t.split(' (')[0] for t in detected_tags[:3]]) if detected_tags else 'N/A'}."
-            ),
+            "vision_description": vision_description,
+            "vision_status": vision_status,
+            "visual_summary": visual_sum,
         }
     except Exception as e:
         return {"error": f"Failed to inspect image: {str(e)}"}
@@ -1064,10 +1258,12 @@ def main():
     )
     parser.add_argument("--search", metavar="PATH", help="Base path for search_files()")
     parser.add_argument(
-        "--search-img-text", metavar="QUERY", help="Test search_image_by_text(query)"
+        "--search-img-desc",
+        metavar="QUERY",
+        help="Test search_images_by_description(query)",
     )
     parser.add_argument(
-        "--search-img-file", metavar="PATH", help="Test search_by_image(path)"
+        "--search-img-file", metavar="PATH", help="Test search_images_by_image(path)"
     )
 
     # Options for tools
@@ -1148,10 +1344,10 @@ def main():
                 recursive=args.recursive,
                 full_path=args.full_path,
             )
-        elif args.search_img_text:
-            result = search_image_by_text(args.search_img_text, top_k=args.top_k)
+        elif args.search_img_desc:
+            result = search_images_by_description(args.search_img_desc, top_k=args.top_k)
         elif args.search_img_file:
-            result = search_by_image(args.search_img_file, top_k=args.top_k)
+            result = search_images_by_image(args.search_img_file, top_k=args.top_k)
         else:
             parser.print_help()
             return

@@ -40,11 +40,11 @@ DEFAULT_USER_AGENT = (
 DEFAULT_TIMEOUT = 10
 MIN_DELAY_BETWEEN_REQUESTS = 1.0
 
-# Increased limits to provide more details while avoiding excessive context bloat
-MAX_EXTRACT_CHARS = 3000  # Increased from 1000
-MAX_ANSWER_CHARS = 2000  # Increased from 800
-MAX_SENTENCES = 12  # Increased from 6
-MAX_EXCERPT_PER_SOURCE = 300  # Increased from 150
+# Context-friendly limits to protect LLM context window
+MAX_EXTRACT_CHARS = 1200
+MAX_ANSWER_CHARS = 800
+MAX_SENTENCES = 6
+MAX_EXCERPT_PER_SOURCE = 150
 
 
 # --- State Management ---
@@ -204,12 +204,12 @@ def extract_relevant_content(
 @mcp.tool("web_search")
 def web_search(
     query: str,
-    max_results: int = 5,  # Increased default from 3
+    max_results: int = 3,
     max_chars: int = MAX_ANSWER_CHARS,
 ) -> Dict[str, Any]:
     """
     Search the web, scrape top results, and synthesize an extractive answer.
-    Optimized to minimize context length.
+    Optimized with strict bounds to minimize LLM context length.
 
     Returns:
       {
@@ -218,7 +218,9 @@ def web_search(
         "sources": [{"title": ..., "href": ..., "excerpt": ...}, ...]
       }
     """
-    print(f"-> web_search: '{query}' (max_results={max_results})")
+    max_results = max(1, min(int(max_results), 5))
+    max_chars = max(200, min(int(max_chars), 1200))
+    print(f"-> web_search: '{query}' (max_results={max_results}, max_chars={max_chars})")
     try:
         search_results = search_web(query=query, max_results=max_results)
         if "error" in search_results:

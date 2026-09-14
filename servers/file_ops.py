@@ -2,14 +2,15 @@ import os
 import shutil
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Any, Tuple
 from mcp.server.fastmcp import FastMCP
-
-from config.settings import load_config
+from config.settings import load_config, PROVIDER_DEFAULTS
 from utils import database
 from helpers import helpers
 import utils.image_search_utils as image_utils
 import utils.fileops_utils as file_utils
+from utils.universal_parser import UniversalParser
+from utils.deduplication import clean_duplicate_uploads
 
 mcp = FastMCP("file_management", port=8000)
 
@@ -17,12 +18,12 @@ config = load_config(verbose=True)
 
 print("Allowed paths:")
 for p in config.user_allowed_paths:
-    print(f"- 📁 {p}")
+    print(f"- [Dir] {p}")
     p.mkdir(exist_ok=True)
 
 print("Media indexed paths:")
 for p in config.user_media_index_allowed_paths:
-    print(f"- 📁 {p}")
+    print(f"- [Dir] {p}")
 
 
 def safe_path(path: Union[str, Path]) -> Path:
@@ -86,28 +87,63 @@ def current_directory():
 
 
 @mcp.tool("list_directory")
-def list_directory(path: str, full_path: bool = False):
+def list_directory(
+    path: str,
+    full_path: bool = False,
+    page: int = 1,
+    page_size: int = 30,
+    extension: str = None,
+    file_type: str = None,
+):
     """
-    Lists immediate directory contents (non-recursive).
+    Lists directory contents with pagination and optional filters to protect LLM context.
     Args:
     - path (str, required): Directory path.
     - full_path (bool, optional): Return absolute paths (default: False, relative names).
-    Returns: Dict with 'items' list of dicts {'name': str, 'type': 'file'|'directory'}, or 'error'.
+    - page (int, optional): Page number starting at 1 (default: 1).
+    - page_size (int, optional): Max items per page, 1-50 (default: 30).
+    - extension (str, optional): Filter by file extension (e.g. '.jpg', 'png', '.txt').
+    - file_type (str, optional): Filter by 'file' or 'directory'.
+    Returns: Dict with 'items' list, 'page', 'page_size', 'total_items', 'total_pages', 'has_more'.
     """
     try:
         base = safe_path(path)
         if not base.is_dir():
-            return {"error": f"{path} is not a valid directory"}
+            return {"error": f"'{path}' is not a valid directory"}
 
-        items = []
-        for p in base.iterdir():
-            items.append(
+        page = max(1, int(page))
+        page_size = max(1, min(int(page_size), 50))
+
+        all_entries = []
+        for p in sorted(base.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+            is_d = p.is_dir()
+            t = "directory" if is_d else "file"
+            if file_type and file_type.lower() != t:
+                continue
+            if extension and not is_d:
+                ext = extension if extension.startswith(".") else f".{extension}"
+                if p.suffix.lower() != ext.lower():
+                    continue
+            all_entries.append(
                 {
                     "name": str(p if full_path else p.name),
-                    "type": "directory" if p.is_dir() else "file",
+                    "type": t,
                 }
             )
-        return {"items": items}
+
+        total_items = len(all_entries)
+        total_pages = max(1, (total_items + page_size - 1) // page_size)
+        start_idx = (page - 1) * page_size
+        items = all_entries[start_idx : start_idx + page_size]
+
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total_items": total_items,
+            "total_pages": total_pages,
+            "has_more": page < total_pages,
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -115,7 +151,7 @@ def list_directory(path: str, full_path: bool = False):
 @mcp.tool("create_directory")
 def create_directory(path: Union[str, List[str]], full_path: bool = False):
     """
-    Creates directory(ies), including parents. Supports batch via list.
+    Creates directory(ies), including parents. Supports batch via list (max 50).
     Args:
     - path (str|List[str], required): Path(s) to create.
     - full_path (bool, optional): Return absolute paths in failed (default: False).
@@ -123,6 +159,9 @@ def create_directory(path: Union[str, List[str]], full_path: bool = False):
     """
     try:
         dir_paths = safe_paths(path)
+        if len(dir_paths) > 50:
+            return {"error": f"Batch limit exceeded ({len(dir_paths)} items). Max 50 items per call."}
+
         failed = []
         for dir_path in dir_paths:
             try:
@@ -148,47 +187,45 @@ def read_file(
     path: Union[str, List[str]],
     full_path: bool = False,
     skip_chars: int = 0,
-    max_chars: int = 500,
-) -> Dict[str, List[Dict[str, str]]]:
+    max_chars: int = 2000,
+    page: int = 1,
+) -> Dict[str, Any]:
     """
-    Reads text file(s) contents, truncated to max_chars. Supports batch via list.
+    Reads file(s) contents cleanly using the Universal Parser.
+    Supports PDF, DOCX, XLSX, PPTX, CSV, IPYNB, Code, Text, Archives, and Media metadata.
+    Strictly bounded by max_chars to protect LLM context.
     Args:
-    - path (str|List[str], required): File path(s).
+    - path (str|List[str], required): File path(s). Max 5 files per call.
     - full_path (bool, optional): Return absolute paths (default: False).
     - skip_chars (int, optional): Skip first n chars (default: 0).
-    - max_chars (int, optional): Max chars per file (default: 500).
-    Returns: Dict with 'results' list of dicts {'path': str, 'content': str} or {'error': str}.
+    - max_chars (int, optional): Max chars per file, capped at 4000 (default: 2000).
+    - page (int, optional): Page number for paginated documents like PDF (default: 1).
+    Returns: Dict with 'results' list of dicts {'path': str, 'format': str, 'content': str, 'is_truncated': bool, 'total_bytes': int}.
     """
     try:
+        max_chars = max(100, min(int(max_chars), 4000))
+        skip_chars = max(0, int(skip_chars))
+        page = max(1, int(page))
         file_paths = safe_paths(path)
+        if len(file_paths) > 5:
+            return {"error": f"Too many files requested ({len(file_paths)}). Max 5 files per call to prevent context overflow."}
+
         results = []
         for file_path in file_paths:
             if not file_path.is_file():
                 results.append({"error": f"'{file_path.name}' is not a valid file"})
                 continue
             try:
-                with file_path.open("r", encoding="utf-8") as f:
-                    # Move the file pointer to the starting position
-                    if skip_chars > 0:
-                        f.seek(skip_chars)
-
-                    # Read the specified number of characters
-                    content = f.read(max_chars)
-
-                    # Check if there's more content to indicate truncation
-                    is_truncated = f.read(1) != ""
-
-                    if is_truncated:
-                        content += f"\n\n[Content truncated to {max_chars} characters for context limit]"
-
-                    results.append(
-                        {
-                            "path": str(file_path if full_path else file_path.name),
-                            "content": content,
-                        }
-                    )
+                parsed = UniversalParser.parse_file(
+                    file_path, max_chars=max_chars, skip_chars=skip_chars, page=page
+                )
+                if not full_path:
+                    parsed["path"] = file_path.name
+                else:
+                    parsed["path"] = str(file_path)
+                results.append(parsed)
             except Exception as e:
-                results.append({"error": str(e)})
+                results.append({"path": file_path.name, "error": str(e)})
         return {"results": results}
     except Exception as e:
         return {"error": str(e)}
@@ -525,7 +562,7 @@ def batch_move(moves: List[Dict[str, str]], full_path: bool = False):
 @mcp.tool("get_file_info")
 def get_file_info(path: Union[str, List[str]], full_path: bool = False):
     """
-    Gets metadata for file(s)/dir(s): size, modified/created times, type. Supports batch.
+    Gets metadata for file(s)/dir(s): size, modified/created times, type. Max 25 paths per call.
     Args:
     - path (str|List[str], required): Path(s) to query.
     - full_path (bool, optional): Return absolute paths (default: False).
@@ -533,6 +570,9 @@ def get_file_info(path: Union[str, List[str]], full_path: bool = False):
     """
     try:
         file_paths = safe_paths(path)
+        if len(file_paths) > 25:
+            return {"error": f"Too many paths requested ({len(file_paths)}). Max 25 per call."}
+
         results = []
         for file_path in file_paths:
             if not file_path.exists():
@@ -565,12 +605,27 @@ def search_files(
     recursive: bool = True,
     full_path: bool = False,
     page: int = 1,
-    page_size: int = 10,
+    page_size: int = 20,
 ):
+    """
+    Searches indexed files with filters and pagination to protect LLM context.
+    Args:
+    - path (str, required): Base directory path.
+    - name (str, optional): Substring in filename.
+    - extension (str, optional): File extension (e.g. '.jpg', 'png', '.txt').
+    - recursive (bool, optional): Search subdirectories (default: True).
+    - full_path (bool, optional): Return absolute paths (default: False).
+    - page (int, optional): Page number (default: 1).
+    - page_size (int, optional): Max results per page, 1-50 (default: 20).
+    Returns: Dict with 'results', 'page', 'page_size', 'total_matches', 'total_pages', 'has_more'.
+    """
     try:
         base = safe_path(path)
         if not base.is_dir():
-            return {"error": f"{path} is not a valid directory"}
+            return {"error": f"'{path}' is not a valid directory"}
+
+        page = max(1, int(page))
+        page_size = max(1, min(int(page_size), 50))
 
         conditions = ["LOWER(path) LIKE ?"]
         params = [f"{str(base).lower()}%"]
@@ -586,17 +641,22 @@ def search_files(
             params.append(f"%{extension.lower()}")
 
         if not recursive:
-            # Match paths with exactly one level deeper (avoid double %)
             conditions.append("path NOT LIKE ?")
             params.append(f"{base}{os.sep}%{os.sep}%")
 
-        query = f"""
-            SELECT path FROM files
-            WHERE {' AND '.join(conditions)}
-            LIMIT {page_size} OFFSET {(page - 1) * page_size}
-        """
+        where_clause = " AND ".join(conditions)
 
+        # Count total matches
+        count_query = f"SELECT COUNT(*) FROM files WHERE {where_clause}"
         with database.db.cursor() as cur:
+            cur.execute(count_query, params)
+            total_matches = cur.fetchone()[0]
+
+            query = f"""
+                SELECT path FROM files
+                WHERE {where_clause}
+                LIMIT {page_size} OFFSET {(page - 1) * page_size}
+            """
             cur.execute(query, params)
             rows = cur.fetchall()
 
@@ -605,41 +665,123 @@ def search_files(
             p = Path(row[0])
             results.append(str(p if full_path else p.relative_to(base)))
 
-        return {"results": results}
+        total_pages = max(1, (total_matches + page_size - 1) // page_size)
+
+        return {
+            "results": results,
+            "page": page,
+            "page_size": page_size,
+            "total_matches": total_matches,
+            "total_pages": total_pages,
+            "has_more": page < total_pages,
+        }
 
     except Exception as e:
         return {"error": str(e)}
 
 
 # Image related tools
-@mcp.tool("search_image_by_text")
-def search_image_by_text(query: str, top_k: int = 5):
+@mcp.tool("search_images_by_description")
+def search_images_by_description(
+    query: str,
+    top_k: int = 5,
+    page: int = 1,
+    page_size: int = 10,
+    min_score: float = None,
+):
     """
-    Semantically searches indexed images by text query.
+    Semantically searches indexed local images by text description using local vision model.
+    Results are bounded and ranked by similarity to protect LLM context.
     Args:
-    - query (str, required): Text description.
-    - top_k (int, optional): Max results (default: 5).
-    Returns: List of absolute image paths.
+    - query (str, required): Natural description of the image(s) to find.
+    - top_k (int, optional): Total top candidates to query from index, max 25 (default: 5).
+    - page (int, optional): Page number (default: 1).
+    - page_size (int, optional): Items per page, 1-20 (default: 10).
+    - min_score (float, optional): Minimum cosine similarity score threshold (0.0 to 1.0).
+    Returns: Dict with 'results' (path, similarity score, metadata), 'total_found', 'has_more'.
     """
-    res = image_utils.search_by_text(query, top_k)
-    return [str(p["path"]) for p in res]
+    try:
+        top_k = max(1, min(int(top_k), 25))
+        page = max(1, int(page))
+        page_size = max(1, min(int(page_size), 20))
+
+        res = image_utils.search_by_text(query, top_k=top_k, min_score=min_score)
+        total_found = len(res)
+        total_pages = max(1, (total_found + page_size - 1) // page_size)
+        start_idx = (page - 1) * page_size
+        paged_results = res[start_idx : start_idx + page_size]
+
+        return {
+            "query": query,
+            "results": [
+                {
+                    "path": str(r["path"]),
+                    "similarity": r.get("similarity"),
+                    "resolution": r.get("resolution"),
+                    "city": r.get("city"),
+                    "country": r.get("country"),
+                }
+                for r in paged_results
+            ],
+            "page": page,
+            "page_size": page_size,
+            "total_found": total_found,
+            "total_pages": total_pages,
+            "has_more": page < total_pages,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
-@mcp.tool("search_by_image")
-def search_by_image(path: str, top_k: int = 5):
+@mcp.tool("search_images_by_image")
+def search_images_by_image(
+    path: str, top_k: int = 5, page: int = 1, page_size: int = 10, min_score: float = None
+):
     """
-    Finds similar indexed images to a given image.
+    Finds visually similar indexed images to a reference image.
     Args:
     - path (str, required): Query image path.
-    - top_k (int, optional): Max results (default: 5).
-    Returns: Dict with 'results' list of absolute image paths.
+    - top_k (int, optional): Total top candidates, max 25 (default: 5).
+    - page (int, optional): Page number (default: 1).
+    - page_size (int, optional): Items per page, 1-20 (default: 10).
+    - min_score (float, optional): Minimum cosine similarity score threshold (0.0 to 1.0).
+    Returns: Dict with 'results' list, 'reference_image', 'total_found', 'has_more'.
     """
-    res = image_utils.search_by_image(path, top_k)
-    return {"results": [str(p["path"]) for p in res]}
+    try:
+        top_k = max(1, min(int(top_k), 25))
+        page = max(1, int(page))
+        page_size = max(1, min(int(page_size), 20))
+
+        res = image_utils.search_by_image(path, top_k=top_k, min_score=min_score)
+        total_found = len(res)
+        total_pages = max(1, (total_found + page_size - 1) // page_size)
+        start_idx = (page - 1) * page_size
+        paged_results = res[start_idx : start_idx + page_size]
+
+        return {
+            "reference_image": path,
+            "results": [
+                {
+                    "path": str(r["path"]),
+                    "similarity": r.get("similarity"),
+                    "resolution": r.get("resolution"),
+                    "city": r.get("city"),
+                    "country": r.get("country"),
+                }
+                for r in paged_results
+            ],
+            "page": page,
+            "page_size": page_size,
+            "total_found": total_found,
+            "total_pages": total_pages,
+            "has_more": page < total_pages,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
-@mcp.tool("search_image_by_metadata")
-def search_image_by_metadata(
+@mcp.tool("search_images_by_metadata")
+def search_images_by_metadata(
     make: str = None,
     model: str = None,
     country: str = None,
@@ -651,7 +793,7 @@ def search_image_by_metadata(
     page_size: int = 10,
 ):
     """
-    Searches indexed images by EXIF/metadata filters.
+    Searches indexed images by EXIF/metadata filters with pagination.
     Args (all optional):
     - make (str): Camera make.
     - model (str): Camera model.
@@ -661,21 +803,420 @@ def search_image_by_metadata(
     - min_height (int): Min image height.
     - has_gps (bool): Has GPS data.
     - page (int): Page number (default: 1).
-    - page_size (int): Page size (default: 10).
-    Returns: List of absolute image paths.
+    - page_size (int): Max results per page, 1-50 (default: 10).
+    Returns: Dict with 'results', 'page', 'page_size', 'count', 'has_more'.
     """
-    res = image_utils.query_by_metadata(
-        make=make,
-        model=model,
-        country=country,
-        city=city,
-        min_width=min_width,
-        min_height=min_height,
-        has_gps=has_gps,
-        page=page,
-        page_size=page_size,
-    )
-    return [str(p["path"]) for p in res]
+    try:
+        page = max(1, int(page))
+        page_size = max(1, min(int(page_size), 50))
+        res = image_utils.query_by_metadata(
+            make=make,
+            model=model,
+            country=country,
+            city=city,
+            min_width=min_width,
+            min_height=min_height,
+            has_gps=has_gps,
+            page=page,
+            page_size=page_size,
+        )
+        return {
+            "results": [str(p["path"]) for p in res],
+            "page": page,
+            "page_size": page_size,
+            "count": len(res),
+            "has_more": len(res) >= page_size,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool("export_images_metadata_csv")
+def export_images_metadata_csv(
+    output_path: str,
+    make: str = None,
+    model: str = None,
+    country: str = None,
+    city: str = None,
+    min_width: int = None,
+    min_height: int = None,
+    has_gps: bool = None,
+    limit: int = None,
+):
+    """
+    Exports indexed image EXIF/GPS metadata to a CSV file, with optional filters.
+    Streams in chunks with an atomic write, so the full table can be exported safely.
+    Args:
+    - output_path (str, required): Destination CSV path (must be inside an allowed path).
+    - make (str, optional): Filter by camera make (substring, case-insensitive).
+    - model (str, optional): Filter by camera model.
+    - country (str, optional): Filter by location country.
+    - city (str, optional): Filter by location city.
+    - min_width (int, optional): Min image width.
+    - min_height (int, optional): Min image height.
+    - has_gps (bool, optional): Only images with GPS (True) or without GPS (False).
+    - limit (int, optional): Max rows to export. Omit or null for all matching rows.
+    Returns: Dict with 'success', 'path', 'row_count'.
+    """
+    try:
+        dest = safe_path(output_path)
+        if dest.suffix.lower() != ".csv":
+            return {"error": "output_path must end with '.csv'"}
+        if limit is not None:
+            limit = int(limit)
+            if limit <= 0:
+                return {"error": "limit must be a positive integer or omitted"}
+        return image_utils.export_images_metadata_to_path(
+            str(dest),
+            make=make,
+            model=model,
+            country=country,
+            city=city,
+            min_width=min_width,
+            min_height=min_height,
+            has_gps=has_gps,
+            limit=limit,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _extract_llm_text(resp: Any) -> str:
+    """Extract plain text from a LangChain chat response (content may be str or blocks)."""
+    content = getattr(resp, "content", resp)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item.get("text") or ""))
+            else:
+                t = getattr(item, "text", None)
+                if isinstance(t, str) and t:
+                    parts.append(t)
+        joined = "".join(parts).strip()
+        return joined if joined else str(content).strip()
+    return str(content).strip()
+
+
+def _call_vision_model(file_path: Path, cfg, question: str = "") -> Tuple[str, str]:
+    """
+    Sends the image to the configured vision-capable LLM.
+    Returns (description, status): description is the model text ("" when unavailable),
+    status is "ok" or an explicit machine-readable reason ("disabled: ...",
+    "not_configured: ...", "no_key: ...", "read_error: ...", "query_failed: ...").
+    Uses the dedicated vision provider / API key when set, otherwise falls
+    back to the main chat provider.
+    """
+    import base64
+
+    provider = (
+        getattr(cfg, "vision_provider", "") or getattr(cfg, "llm_provider", "") or "openai"
+    ).lower()
+    model = (getattr(cfg, "vision_model", "") or "").strip()
+    if not getattr(cfg, "vision_enabled", False):
+        return "", "disabled: vision model is turned off in AI settings (Visual AI)"
+    if not model:
+        return "", "not_configured: vision model name is empty in AI settings (Visual AI)"
+
+    preset = PROVIDER_DEFAULTS.get(provider, PROVIDER_DEFAULTS.get("custom", {}))
+
+    # Resolve API Key: prioritize provider-specific key in config, then fallback to environment
+    api_key = (
+        (cfg.get_api_key_for_provider(provider) if hasattr(cfg, "get_api_key_for_provider") else "")
+        or ""
+    ).strip()
+    main_provider = (getattr(cfg, "llm_provider", "") or "").lower()
+    if not api_key and provider == main_provider:
+        api_key = (getattr(cfg, "llm_api_key", "") or "").strip()
+    env_var = preset.get("env_key")
+    if not api_key and env_var:
+        api_key = (os.getenv(env_var) or "").strip()
+    if not api_key and preset.get("requires_api_key", False) and provider != "ollama":
+        return "", (
+            f"no_key: no API key saved for vision provider '{provider}'. "
+            f"Add it under Provider & Credentials, or pick a different vision provider."
+        )
+
+    if provider == main_provider:
+        base_url = (getattr(cfg, "llm_base_url", "") or preset.get("base_url", "") or "").strip()
+    else:
+        base_url = (preset.get("base_url", "") or "").strip()
+
+    # Read and base64-encode the image
+    try:
+        image_bytes = file_path.read_bytes()
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        suffix = file_path.suffix.lower().lstrip(".")
+        mime_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif",
+            "webp": "image/webp", "bmp": "image/bmp",
+        }
+        mime_type = mime_map.get(suffix, "image/jpeg")
+    except Exception as e:
+        print(f"[Vision Model Error] Failed to read/encode image '{file_path.name}': {e}")
+        return "", f"read_error: could not read image file '{file_path.name}': {e}"
+
+    extra = (question or "").strip()
+    if extra:
+        prompt = (
+            "Answer the following question about this image. Be concise but specific. "
+            f"Question: {extra}\n\n"
+            "Also give a one-sentence overall description of the scene."
+        )
+    else:
+        prompt = (
+            "Describe this image in detail. Include: what is shown, the scene or setting, "
+            "notable objects, people, colors, mood, and any readable text. Be concise but thorough."
+        )
+
+    try:
+        from langchain_core.messages import HumanMessage
+
+        # Standard LangChain multimodal HumanMessage with image_url data URI
+        msg = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{b64_image}"},
+                },
+            ]
+        )
+
+        if provider == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(
+                model=model,
+                google_api_key=api_key,
+                temperature=0.1,
+            )
+            resp = llm.invoke([msg])
+            text = _extract_llm_text(resp)
+            if text:
+                return text, "ok"
+            return "", f"empty_response: vision model '{model}' returned no text"
+
+        elif provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+            llm = ChatAnthropic(
+                model=model,
+                api_key=api_key,
+                temperature=0.1,
+            )
+            resp = llm.invoke([msg])
+            text = _extract_llm_text(resp)
+            if text:
+                return text, "ok"
+            return "", f"empty_response: vision model '{model}' returned no text"
+
+        else:
+            # OpenAI / OpenRouter / Groq / Ollama / Custom (OpenAI-compatible)
+            from langchain_openai import ChatOpenAI
+            kwargs = {"api_key": api_key or "no-key", "temperature": 0.1}
+            if base_url:
+                kwargs["base_url"] = base_url
+            elif provider == "openrouter":
+                kwargs["base_url"] = "https://openrouter.ai/api/v1"
+            elif provider == "groq":
+                kwargs["base_url"] = "https://api.groq.com/openai/v1"
+            elif provider == "ollama":
+                kwargs["base_url"] = "http://localhost:11434/v1"
+                kwargs["api_key"] = "ollama"
+
+            llm = ChatOpenAI(
+                model=model,
+                **kwargs,
+            )
+            resp = llm.invoke([msg])
+            text = _extract_llm_text(resp)
+            if text:
+                return text, "ok"
+            return "", f"empty_response: vision model '{model}' returned no text"
+
+    except Exception as e:
+        print(f"[Vision Model Error] Failed to query {provider} vision model '{model}': {e}")
+        return "", (
+            f"query_failed: vision provider '{provider}' model '{model}' error: {e}. "
+            f"Check the model name exists on that provider and the API key is valid."
+        )
+
+
+@mcp.tool("inspect_image")
+def inspect_image(path: str, question: str = "") -> Dict[str, Any]:
+    """
+    Visually inspects and describes an image file on disk.
+    Extracts dimensions, format, color space, camera EXIF metadata, GPS location,
+    dominant color palette, and local SigLIP zero-shot semantic tags.
+    Allows text-only LLMs to perceive and accurately describe image contents without raw pixels.
+    Args:
+    - path (str, required): Path to the image file.
+    - question (str, optional): Specific question or detail to ask the vision model about
+      this image (e.g. "what does the sign say?", "is there a person wearing red?").
+      When empty, a general detailed description is returned.
+    Returns: Dict with structured visual properties, camera telemetry, geolocation,
+      semantic tags, vision_description (vision-model text or null when unavailable),
+      and vision_status (always present: "ok" or an explicit reason such as
+      "disabled: ...", "not_configured: ...", "no_key: ...", "query_failed: ...").
+      If vision_status is not "ok", treat vision_description as missing and say so.
+    """
+    try:
+        file_path = safe_path(path)
+        if not file_path.is_file():
+            return {"error": f"'{file_path.name}' is not a valid file"}
+
+        from PIL import Image
+        from math import gcd
+        with Image.open(file_path) as img:
+            w, h = img.size
+            fmt = img.format or file_path.suffix.upper().replace(".", "")
+            mode = img.mode
+
+            d = gcd(w, h)
+            simplified_ratio = f"{w // d}:{h // d}" if d > 1 and (w // d) <= 32 else f"{w/h:.2f}:1"
+            orientation_desc = "landscape" if w > h else ("portrait" if h > w else "square")
+
+            # Dominant colors
+            thumb = img.convert("RGB").resize((40, 40))
+            colors = thumb.getcolors(maxcolors=1600)
+            dominant_colors = []
+            if colors:
+                sorted_colors = sorted(colors, key=lambda x: x[0], reverse=True)[:4]
+                total_px = sum(c[0] for c in sorted_colors)
+                for count, (r, g, b) in sorted_colors:
+                    pct = int((count / total_px) * 100)
+                    if r > 200 and g > 200 and b > 200:
+                        c_name = "White / Light"
+                    elif r < 45 and g < 45 and b < 45:
+                        c_name = "Black / Dark"
+                    elif r > g and r > b:
+                        c_name = "Red / Warm Tones" if r > 150 and g < 100 else "Orange / Brown"
+                    elif g > r and g > b:
+                        c_name = "Green / Foliage"
+                    elif b > r and b > g:
+                        c_name = "Blue / Sky / Water"
+                    elif abs(r - g) < 25 and abs(g - b) < 25:
+                        c_name = "Gray / Neutral"
+                    else:
+                        c_name = "Mixed / Vibrant"
+                    dominant_colors.append(f"{c_name} (~{pct}%)")
+
+            # EXIF metadata
+            from utils import exif_utils
+            raw_exif = exif_utils.get_exif_data(file_path)
+            exif_summary = {}
+            if raw_exif:
+                camera_meta = exif_utils.get_camera_metadata(raw_exif)
+                for k, v in camera_meta.items():
+                    if v:
+                        exif_summary[k] = v
+
+                gps_meta = exif_utils.get_gps_info(raw_exif)
+                if gps_meta and "latitude" in gps_meta and "longitude" in gps_meta:
+                    exif_summary["gps"] = {
+                        "latitude": gps_meta.get("latitude"),
+                        "longitude": gps_meta.get("longitude"),
+                    }
+                    geo = exif_utils.reverse_geocode(gps_meta["latitude"], gps_meta["longitude"])
+                    if geo:
+                        exif_summary["location_display_name"] = geo.get("display_name")
+                        exif_summary["country"] = geo.get("country")
+                        exif_summary["city"] = geo.get("city")
+
+            # SigLIP Semantic Perception
+            candidate_tags = [
+                "outdoor landscape",
+                "nature trees and foliage",
+                "beach ocean or sea",
+                "sunset or sunrise",
+                "city street and architecture",
+                "person or portrait",
+                "screenshot of software code or browser",
+                "document invoice or text receipt",
+                "food beverage or dining",
+                "animal pet dog or cat",
+                "vehicle car or transportation",
+                "diagram chart or infographic",
+                "night city with lights",
+                "indoor room or home interior",
+            ]
+            detected_tags = []
+            try:
+                import torch
+                proc, mod = image_utils.get_model_and_processor()
+                proc_inputs = proc(
+                    text=candidate_tags, images=img, padding="max_length", return_tensors="pt"
+                ).to(image_utils.DEVICE)
+                with torch.no_grad():
+                    out = mod(**proc_inputs)
+                    probs = torch.sigmoid(out.logits_per_image).cpu().squeeze().tolist()
+
+                tag_scores = list(zip(candidate_tags, probs))
+                tag_scores.sort(key=lambda x: x[1], reverse=True)
+                for tag, score in tag_scores[:5]:
+                    if score >= 0.15:
+                        detected_tags.append(f"{tag} ({score:.2f})")
+            except Exception:
+                pass
+
+        # Vision model description (optional — only when configured).
+        # vision_status is ALWAYS set so the main model knows why the
+        # description is missing instead of seeing a bare null.
+        vision_description = None
+        vision_status = "disabled: vision model is turned off in AI settings (Visual AI)"
+        _cfg = load_config()
+        if getattr(_cfg, "vision_enabled", False) and getattr(_cfg, "vision_model", ""):
+            _desc, _status = _call_vision_model(file_path, _cfg, question=question)
+            vision_description = _desc or None
+            vision_status = _status
+        elif getattr(_cfg, "vision_enabled", False):
+            vision_status = "not_configured: vision model name is empty in AI settings (Visual AI)"
+
+        visual_sum = (
+            f"{orientation_desc.capitalize()} {fmt} image ({w}x{h}). "
+            f"Dominant palette: {', '.join(dominant_colors[:2]) if dominant_colors else 'N/A'}. "
+            f"Visual tags: {', '.join([t.split(' (')[0] for t in detected_tags[:3]]) if detected_tags else 'N/A'}."
+        )
+        if vision_description:
+            visual_sum += f" Vision description: {vision_description[:200]}{'...' if len(vision_description) > 200 else ''}"
+        elif vision_status != "disabled: vision model is turned off in AI settings (Visual AI)":
+            visual_sum += f" Vision model note: {vision_status}"
+
+        return {
+            "path": str(file_path),
+            "filename": file_path.name,
+            "format": fmt,
+            "dimensions": f"{w}x{h}",
+            "aspect_ratio": f"{simplified_ratio} ({orientation_desc})",
+            "file_size_bytes": file_path.stat().st_size,
+            "dominant_palette": dominant_colors,
+            "detected_visual_concepts": detected_tags,
+            "exif_metadata": exif_summary,
+            "vision_description": vision_description,
+            "vision_status": vision_status,
+            "visual_summary": visual_sum,
+        }
+    except Exception as e:
+        return {"error": f"Failed to inspect image: {str(e)}"}
+
+
+@mcp.tool("deduplicate_uploads")
+def deduplicate_uploads(directory: str = "uploads") -> Dict[str, Any]:
+    """
+    Scans the uploads directory, groups files by SHA-256 hash, and removes redundant duplicates.
+    Keeps the primary file for each unique hash and reclaims storage space.
+    Returns: Dict with unique_files count, duplicates_removed count, and bytes_reclaimed.
+    """
+    try:
+        resolved = safe_path(directory)
+        return clean_duplicate_uploads(str(resolved))
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def main():
@@ -717,10 +1258,12 @@ def main():
     )
     parser.add_argument("--search", metavar="PATH", help="Base path for search_files()")
     parser.add_argument(
-        "--search-img-text", metavar="QUERY", help="Test search_image_by_text(query)"
+        "--search-img-desc",
+        metavar="QUERY",
+        help="Test search_images_by_description(query)",
     )
     parser.add_argument(
-        "--search-img-file", metavar="PATH", help="Test search_by_image(path)"
+        "--search-img-file", metavar="PATH", help="Test search_images_by_image(path)"
     )
 
     # Options for tools
@@ -801,10 +1344,10 @@ def main():
                 recursive=args.recursive,
                 full_path=args.full_path,
             )
-        elif args.search_img_text:
-            result = search_image_by_text(args.search_img_text, top_k=args.top_k)
+        elif args.search_img_desc:
+            result = search_images_by_description(args.search_img_desc, top_k=args.top_k)
         elif args.search_img_file:
-            result = search_by_image(args.search_img_file, top_k=args.top_k)
+            result = search_images_by_image(args.search_img_file, top_k=args.top_k)
         else:
             parser.print_help()
             return

@@ -1,26 +1,72 @@
-# MediaMCP – Intelligent Local Media Management 🧠
+# MediaMCP - Intelligent Local Media Management 🧠
 
-Chat with your local photo and video library using the power of AI\! 🤖 MediaMCP combines local vision models for **privacy** 🛡️ with Groq's LLM API to create an intelligent, conversational media experience.
+Chat with your local photo and document library using the power of AI! 🤖 MediaMCP combines local vision models for **privacy** 🛡️ with your choice of LLM provider (OpenAI, Anthropic, Google, Groq, OpenRouter, Ollama, or any OpenAI-compatible endpoint) to create an intelligent, conversational media experience.
 
-All heavy processing of your photos and videos happens on your machine, ensuring **total privacy**. The LLM acts as a smart orchestrator, understanding your **natural language commands** 🗣️ to search, organize, and manage your files.
+Your library is indexed right on your machine for fast, private search. The LLM acts as a smart orchestrator, understanding your **natural language commands** 🗣️ to search, organize, and manage your files.
 
 -----
 
 ## Core Features ✨
 
-  - 💬 **Conversational Search**: Find media with simple queries like *"show me sunset photos from last May"* 🌅 or *"find videos of my dog at the beach."* 🐶
+### 💬 Conversational Media Chat
+  - Chat with your media library in plain language, no commands or syntax to learn
+  - Past conversations are saved and searchable on your device
+  - See the assistant's reasoning and which actions it took, step by step
+  - Token usage shown for transparency on every reply
+  - Attach files in chat, images preview inline, videos play inline
+  - Duplicate uploads are detected automatically
+  - Results show image grids with links to open or reveal files on your computer
+  - Custom instructions and creativity control for the assistant
 
-  - ✨ **Semantic Similarity Search**: Pick a reference image 🖼️ or use a text description to instantly find the most visually similar items in your library.
+### 🔎 Semantic Image Search
+  - Find photos by describing them, e.g. *"sunset photos"*
+  - Find visually similar photos from a reference image
+  - Filter photos by camera, location, size, or GPS availability
+  - Inspect any photo for details: colors, camera info, location, and content tags, with optional AI description when Visual AI is enabled
 
-  - 📂 **Natural-Language File Management**: Use simple commands to manage your files. Ask the agent to `move photos to a new folder`, `copy specific files`, or `create a directory structure`. The LLM translates your request into the correct file operations.
+### 📂 Natural-Language File Management
+  - Browse, search, and get info about files and folders by asking in chat
+  - Create folders, read documents, copy, move, rename, and delete files
+  - Works only inside folders you explicitly allow, for safety
+  - Reads common formats: PDFs, Word, Excel, PowerPoint, CSV, notebooks, archives, and code/text files
+  - Detects and cleans up duplicate uploads
+  - Exports your photo metadata to a spreadsheet file with filters
 
-  - ⚙️ **Smart Ingestion Pipeline**: New media is automatically detected, scanned, and embedded 📥, making it immediately available for semantic search.
+### 🖼️ Smart Media Indexing
+  - New, changed, moved, or deleted files are detected automatically
+  - Photos are indexed locally for fast similarity search
+  - Photo details (camera, date, location) extracted automatically, including city/country lookup from GPS
+  - Background scanning with progress and cancel, so the app stays responsive
+  - Custom exclusion rules to skip folders or file types you don't want indexed
 
-  - 🔒 **Privacy-First Architecture**: Image and video analysis, embedding generation (using **SigLIP**), and metadata extraction are performed **entirely on your device** 💻.
+### 🌐 Web Search
+  - Ask questions that need current or web knowledge
+  - Get summarized answers with source links
+  - Can read and summarize the content of a web page
 
-  - 🤔 **Transparent ReAct Agent**: The LLM "thinks" out loud, showing you which tools it's using and why. This gives you full visibility into the process without needing to learn any syntax.
+### 🔌 Works With Your Choice of AI Provider
+  - Supports OpenAI, Anthropic, Google, Groq, OpenRouter, local Ollama, or any compatible provider
+  - Switch providers and models from the sidebar, with automatic model listing
+  - Optional separate vision model for richer photo descriptions, otherwise photo analysis stays fully local
 
-  - 🛠️ **Extensible Toolset**: Easily add your own custom Python functions 🐍 and expose them to the AI agent to expand its capabilities.
+### 🔒 Privacy-First, With One Trade-off
+  - Indexing, photo analysis, file operations, and chat history all stay on your device
+  - Your chat text is sent to your chosen AI provider, along with any file content the assistant reads to answer you and any photo sent for a Visual AI description
+  - For fully offline chat, use a local provider such as Ollama
+  - For better privacy, use self hosted and local models so your content stays on your own machine
+
+> **Heads up:** chat text plus any file content the assistant reads and any photo sent for a Visual AI description are shared with your chosen LLM provider. For the best privacy, use self hosted or local models.
+
+-----
+
+## Limitations ⚠️
+
+  - Images only for content search, videos and audio can be managed and previewed but are not indexed by content, with no keyframe or scene detection
+  - Slow initial scan, large libraries take time to index on first run, use local disk space for the index, and run faster with a GPU
+  - Internet only needed for cloud AI providers, web search, and location name lookups, local hosting works fully offline
+  - Text-based document reading, scanned files without selectable text, handwritten notes, and complex layouts may not read well
+  - Single local user, chat history and indexes live on your machine, with no multi-user or cloud sync
+  - AI-dependent accuracy, search results and file actions follow the model's interpretation, so complex requests may need rephrasing or confirmation
 
 -----
 
@@ -28,11 +74,11 @@ All heavy processing of your photos and videos happens on your machine, ensuring
 
 MediaMCP uses a hybrid model that balances privacy and power:
 
-1.  **💻 Local Processing**: A local AI vision model (**SigLIP**) scans your media files, generating vector embeddings. **Your files never leave your computer.**
-2.  **🗣️ Language Understanding**: When you type a command, the text is sent to the Groq LLM API.
-3.  **🤖 Reasoning & Tool Use**: The LLM uses a ReAct pattern to interpret your request and decide which local tool to use (e.g., `find_top_k_similar_images`, `move_file`).
-4.  **⚙️ Execution**: The local server executes the command on your filesystem.
-5.  **✅ Response**: The LLM observes the result, decides if the task is complete, and gives you a final response in the chat.
+1.  **💻 Local Processing**: Your photos are analyzed on your computer and indexed for search. The index itself stays local.
+2.  **🗣️ Language Understanding**: When you type a message, it is sent to your chosen AI provider, together with any file content or photo the assistant needs to read to answer you.
+3.  **🤖 Reasoning & Tool Use**: The AI figures out which local actions to take, searching photos, managing files, or searching the web.
+4.  **⚙️ Execution**: The actions run locally on your machine, inside your allowed folders.
+5.  **✅ Response**: The AI reviews the results and replies in chat with previews, links, and an explanation.
 
 -----
 
@@ -40,20 +86,20 @@ MediaMCP uses a hybrid model that balances privacy and power:
 
 #### ✅ **Implemented**
 
-  - 🗂️ **Basic File System Operations**: Create, read, delete, move, and copy files/folders via chat.
-  - 🔄 **Incremental Media Scanning**: Automatically detect new, updated, or removed media.
-  - 🔎 **Semantic Search**: Text-to-image and image-to-image similarity search (`top_k`).
-  - 🤖 **Conversational Agent**: ReAct-based agent with visible reasoning steps.
-  - 🌐 **Web Search & Scraping**: Ask questions that require web access.
-  - 📸 **EXIF Data Extraction**: Automatically read metadata like date, time, and location.
+  - 🗂️ **File operations by chat**: browse, create, read, copy, move, rename, delete, upload deduplication, metadata export
+  - 🔄 **Incremental media scanning**: detects new, updated, moved, or removed files in the background
+  - 🔎 **Photo search**: search by description, by similar photo, or by camera/location filters
+  - 🤖 **Conversational assistant**: explains its reasoning, keeps chat history, supports attachments and custom instructions
+  - 🌐 **Web search**: answers with summaries and source links
+  - 📸 **Photo details**: camera info, dates, and GPS-based location lookup
+  - 📄 **Document reading**: PDFs, office files, spreadsheets, presentations, notebooks, archives, and code/text
+  - 🔌 **Multiple AI providers**: OpenAI, Anthropic, Google, Groq, OpenRouter, Ollama, or custom endpoints, with optional vision model
 
 #### 🔜 **In Progress & Future Goals**
 
-  - 🗂️ **Automatic Semantic Organization**: The next major focus. Develop tools that can understand content and automatically suggest folder placements (e.g., grouping vacation photos by city).
-  - ⚡ **Asynchronous Scanning & Processing**: Improve performance by moving the current synchronous scanning process to a background, asynchronous pipeline to keep the UI responsive, especially with large libraries.
-  - 🎬 **Advanced Video Analysis**: Semantic video search, keyframe extraction, and scene detection.
-  - 🎨 **Enhanced UI**: Add search filters, media previews, and a full browsing interface.
-  - 🔌 **Custom Tool Plug-in System**: Streamline the process for users to add their own tools.
+  - 🗂️ **Automatic organization**: suggest folder placements by photo content, e.g. grouping vacation photos by city
+  - 🎬 **Video understanding**: content search, keyframe extraction, and scene detection
+  - 🔌 **Attach your own MCP servers**: connect external or custom MCP tools to extend what the assistant can do
 
 -----
 
@@ -62,8 +108,8 @@ MediaMCP uses a hybrid model that balances privacy and power:
 ### 1\. Prerequisites ✅
 
   - [Git](https://git-scm.com/)
-  - [Python 3.9+](https://www.python.org/downloads/)
-  - [Groq API Key](https://console.groq.com/)
+  - [Python 3.11+](https://www.python.org/downloads/)
+  - Large language model and multimodal LLM access (OpenAI, Anthropic, Google, Groq, or OpenRouter, or local [Ollama](https://ollama.com/) / any OpenAI-compatible endpoint)
 
 ### 2\. Clone the Repository 📂
 
@@ -76,7 +122,7 @@ cd media-mcp
 
 ### 3\. Install Dependencies with `uv` 📦
 
-This project uses [`uv`](https://www.google.com/search?q=%5Bhttps://github.com/astral-sh/uv%5D\(https://github.com/astral-sh/uv\)), a fast Python package manager.
+This project uses `uv`, a fast Python package manager.
 
 ```bash
 # First, install uv
@@ -86,38 +132,24 @@ pip install uv
 uv sync
 ```
 
-### 4\. Configure Environment Variables 🔑
-
-Create a `.env` file in the project root (`media-mcp/.env`). You can do this by copying the example file:
-
-```bash
-cp .env.example .env
-```
-
-Now, open the `.env` file and add your Groq API key:
-
-```env
-# Get your free key from https://console.groq.com/
-GROQ_API_KEY="your_api_key_here"
-```
-
-### 5\. Run the Application 🚀
+### 4\. Run the Application 🚀
 
 You have two ways to run the application.
 
 #### Option 1: Easy Start (Recommended)
 
-For a quick and easy start, use the new launch script. This will start all the necessary servers and the client application in a single terminal.
+For a quick and easy start, use the launch script. This starts all necessary servers and the client application together in a single terminal:
 
 ```bash
-python launch.py
+uv run launch.py
+# or: python launch.py
 ```
 
 #### Option 2: Manual Launch (For Development)
 
-If you are developing and need to see the logs for each process separately, it is recommended to run the servers and the client in three different terminals.
+If you are developing and need to see the logs for each process separately, run the servers and the client in three different terminals:
 
-> **⚠️ Important**: Make sure you are in the `media-mcp` directory in each terminal.
+> **⚠️ Important**: Make sure you are in the project root directory in each terminal.
 
 | Terminal 1: File Ops Server  | Terminal 2: Web Search Server  | Terminal 3: Client App |
 | ---------------------------- | ------------------------------ | ---------------------- |
@@ -125,7 +157,22 @@ If you are developing and need to see the logs for each process separately, it i
 
 -----
 
-After running the application with either method, the **MediaMCP chat interface** will open in your browser at `http://localhost:8501`. 🎉
+The **MediaMCP chat interface** will open in your browser at `http://localhost:8501`. 🎉
+
+-----
+
+### 5\. Configure via UI / User Config ⚙️
+
+No `.env` file is required! All settings and credentials are managed directly through the user configuration file (`config/config.json`) and the application sidebar:
+
+1. **AI Provider & API Keys**: In the sidebar under **🔌 Provider & Credentials**, select your active provider (Google Gemini, Groq, OpenAI, Anthropic, OpenRouter, local Ollama, etc.) and enter your API key.
+2. **Model Selection**: Choose your preferred chat model from the dynamically loaded list.
+3. **Allowed Paths**: Add the local folders you want MediaMCP to access and index under **Allowed Directories**.
+4. **Visual AI (Optional)**: Configure an optional vision model under **Visual AI (Image Inspection)** for enhanced photo descriptions.
+
+All choices and keys are saved locally in `config/config.json`.
+
+> **💡 Note**: Standard environment variables (e.g. `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`) are still supported as optional fallbacks if you prefer them.
 
 -----
 
